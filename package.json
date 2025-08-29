@@ -1,0 +1,16 @@
+{
+  "name": "raydium-lp-burn-poller",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Raydium LP burn 95–100% incinerator arány polling + Telegram értesítés",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.7",
+    "@solana/web3.js": "^1.95.3",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2"
+  }
+}
