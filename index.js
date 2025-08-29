@@ -1,62 +1,60 @@
 import 'dotenv/config';
 import fs from 'fs';
 import fetch from 'node-fetch';
+import WebSocket from 'ws';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { getAssociatedTokenAddress, getAccount, getMint } from '@solana/spl-token';
 
-/* ======== ENV & CONST ======== */
+/* ===== ENV ===== */
 const {
-  RAYDIUM_POOLS_URL,
+  PUMPPORTAL_WS = 'wss://pumpportal.fun/api/data',
+  PUMPPORTAL_METHOD = 'subscribeMigration',
   SOLANA_RPC,
-  POLL_MS = '10000',
   THRESHOLD = '0.95',
   TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID
+  TELEGRAM_CHAT_ID,
 } = process.env;
 
+if (!/^wss?:\/\//i.test(PUMPPORTAL_WS)) {
+  console.error('Hiba: PUMPPORTAL_WS nincs beállítva vagy nem ws/wss URL:', PUMPPORTAL_WS);
+  process.exit(1);
+}
 if (!SOLANA_RPC || !/^https?:\/\//i.test(SOLANA_RPC)) {
   console.error('Hiba: SOLANA_RPC hiányzik vagy nem http/https:', SOLANA_RPC);
   process.exit(1);
 }
 
-console.log('RAYDIUM_POOLS_URL =', JSON.stringify(RAYDIUM_POOLS_URL));
-console.log('SOLANA_RPC =', SOLANA_RPC?.slice(0, 60) + '...');
-console.log('POLL_MS =', POLL_MS, 'THRESHOLD =', THRESHOLD);
+console.log('PUMPPORTAL_WS =', PUMPPORTAL_WS);
+console.log('PUMPPORTAL_METHOD =', PUMPPORTAL_METHOD);
+console.log('SOLANA_RPC =', SOLANA_RPC.slice(0, 64) + '...');
+console.log('THRESHOLD =', THRESHOLD);
 
+/* ===== Állandók, állapot ===== */
 const INCINERATOR = new PublicKey('1nc1nerator11111111111111111111111111111111');
 const conn = new Connection(SOLANA_RPC, 'confirmed');
 
 const STATE_FILE = './state.json';
-let state = { lastSeenKey: 0, burnedMints: [] };
-
+let state = { burnedMints: [], seenMints: [] };
 try {
   if (fs.existsSync(STATE_FILE)) {
     state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
   }
 } catch (e) {
-  console.warn('State betöltés hiba, új állapot indul:', e.message);
+  console.warn('State betöltés hiba, tiszta indulás:', e.message);
 }
 const burnedSet = new Set(state.burnedMints || []);
-
+const seenSet = new Set(state.seenMints || []);
 function saveState() {
   try {
     state.burnedMints = Array.from(burnedSet);
+    state.seenMints = Array.from(seenSet);
     fs.writeFileSync(STATE_FILE, JSON.stringify(state));
   } catch (e) {
     console.warn('State mentés hiba:', e.message);
   }
 }
 
-/* ======== HELPERS ======== */
-function extractLpMint(poolObj) {
-  return poolObj?.lpMint || poolObj?.lpMintAddress || poolObj?.lp || null;
-}
-function extractSortKey(poolObj) {
-  // időbélyeg jellegű kulcsok egyikét használjuk
-  const k = poolObj?.createdAt ?? poolObj?.createTime ?? poolObj?.updatedAt ?? poolObj?.updateTime ?? 0;
-  return Number(k) || 0;
-}
-
+/* ===== Segédek ===== */
 async function tgNotify(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
@@ -67,52 +65,14 @@ async function tgNotify(text) {
     console.warn('Telegram hiba:', e.message);
   }
 }
+function pick(obj, ...keys) { for (const k of keys) { if (obj && obj[k] != null) return obj[k]; } }
 
-/* ======== POOLS FETCH (fallback-okkal) ======== */
-async function fetchPoolsWithFallback() {
-  const candidates = [
-    RAYDIUM_POOLS_URL,                                 // amit env-ben megadtál
-    'https://api-v3.raydium.io/pools',                 // általános listázó
-    'https://api-v3.raydium.io/pools/info',            // részletes lista
-    'https://api-v3.raydium.io/ammV3/pools'            // egyes edge-eknél ez él
-  ].filter(Boolean);
-
-  for (const url of candidates) {
-    try {
-      console.log('Trying pools URL:', url);
-      const r = await fetch(url);
-      const text = await r.text();
-      if (!r.ok) {
-        console.error(`Fetch ${url} -> HTTP ${r.status}. Body head:`, text.slice(0, 200));
-        continue;
-      }
-      let json;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        console.error(`Fetch ${url} -> 200, de nem JSON. Head:`, text.slice(0, 200));
-        continue;
-      }
-      const pools = Array.isArray(json) ? json : (json.data || json.pools || []);
-      if (!Array.isArray(pools)) {
-        console.error(`Fetch ${url} -> JSON ok, de nincs pools tömb. Keys:`, Object.keys(json));
-        continue;
-      }
-      console.log(`Using pools URL: ${url} (count=${pools.length})`);
-      return pools;
-    } catch (e) {
-      console.error(`Fetch ${url} exception:`, e.message);
-    }
-  }
-  throw new Error('Minden pools endpoint elbukott.');
-}
-
-/* ======== LP BURN CHECK ======== */
+/* ===== LP burn ellenőrzés (incinerator arány) ===== */
 async function isLpBurned100Percent(lpMintStr, threshold = Number(THRESHOLD)) {
   const lpMint = new PublicKey(lpMintStr);
   const incAta = await getAssociatedTokenAddress(lpMint, INCINERATOR, true);
 
-  const mintInfo = await getMint(conn, lpMint);
+  const mintInfo = await getMint(conn, lpMint); // supply raw integer
   const supplyRaw = BigInt(mintInfo.supply.toString());
   if (supplyRaw === 0n) return false;
 
@@ -121,81 +81,102 @@ async function isLpBurned100Percent(lpMintStr, threshold = Number(THRESHOLD)) {
     const incAcc = await getAccount(conn, incAta);
     incBalRaw = BigInt(incAcc.amount.toString());
   } catch {
-    return false; // nincs ATA -> biztos nem 95%+
+    // nincs incinerator ATA -> biztos nem 95%+
+    return false;
   }
   const ratio = Number(incBalRaw) / Number(supplyRaw);
   return ratio >= threshold;
 }
 
-/* ======== POLLING ======== */
-async function fetchNewPools() {
-  const pools = await fetchPoolsWithFallback();
+/* ===== Esemény kezelése a WS feedről ===== */
+async function handleMigrationEvent(ev) {
+  // a PumpPortal migration esemény formátuma szolgáltatófüggő,
+  // próbálunk rugalmasan mezőt találni:
+  const lpMint =
+    pick(ev, 'raydiumLpMint', 'raydium_lp_mint', 'lpMint', 'lp_mint', 'lp') ||
+    pick(ev?.data, 'raydiumLpMint', 'lpMint', 'lp');
 
-  // csökkenő időrend
-  pools.sort((a, b) => extractSortKey(b) - extractSortKey(a));
-
-  if (!state.lastSeenKey || state.lastSeenKey === 0) {
-    const topKey = extractSortKey(pools[0]) || Date.now();
-    state.lastSeenKey = topKey;
-    saveState();
-    return [];
+  if (!lpMint) {
+    console.log('⚠️ Eseményben nincs lpMint:', JSON.stringify(ev).slice(0, 240));
+    return;
   }
+  if (seenSet.has(lpMint)) return; // már feldolgoztuk
+  seenSet.add(lpMint);
+  saveState();
 
-  const fresh = pools.filter(p => extractSortKey(p) > state.lastSeenKey);
-  if (fresh.length > 0) {
-    state.lastSeenKey = extractSortKey(fresh[0]);
-    saveState();
-  }
-  return fresh;
-}
+  const symbol = pick(ev, 'symbol', 'ticker', 'sym') || pick(ev?.data, 'symbol', 'ticker');
+  const name = pick(ev, 'name', 'tokenName') || pick(ev?.data, 'name', 'tokenName');
+  const tx = pick(ev, 'signature', 'sig', 'tx') || pick(ev?.data, 'signature', 'tx');
 
-async function poll() {
+  let ok = false;
   try {
-    const newPools = await fetchNewPools();
-    if (newPools.length === 0) return;
-
-    for (const p of newPools) {
-      const lpMint = extractLpMint(p);
-      if (!lpMint) continue;
-      if (burnedSet.has(lpMint)) continue; // ne duplázzuk
-
-      let confirmed = false;
-      try {
-        confirmed = await isLpBurned100Percent(lpMint);
-      } catch (e) {
-        console.warn('Check hiba', lpMint, e.message);
-      }
-
-      const id = p.id || p.poolId || '(no-id)';
-      const when = extractSortKey(p);
-
-      if (confirmed) {
-        burnedSet.add(lpMint);
-        saveState();
-        const msg = [
-          '🔥 <b>100% LP burn confirmed</b>',
-          `LP mint: <code>${lpMint}</code>`,
-          `Pool: ${id}`,
-          `TimeKey: ${when}`
-        ].join('\n');
-        console.log(msg.replace(/<[^>]+>/g, ''));
-        await tgNotify(msg);
-      } else {
-        console.log(`ℹ️ Nem 95%+: ${lpMint} (pool: ${id})`);
-      }
-    }
+    ok = await isLpBurned100Percent(lpMint);
   } catch (e) {
-    console.error('Poll error:', e.message);
+    console.warn('Check hiba', lpMint, e.message);
+    return;
+  }
+
+  if (ok && !burnedSet.has(lpMint)) {
+    burnedSet.add(lpMint);
+    saveState();
+    const msg = [
+      '🔥 <b>100% LP burn confirmed</b>',
+      symbol || name ? `Token: <b>${symbol || name}</b>` : null,
+      `LP mint: <code>${lpMint}</code>`,
+      tx ? `Tx: <code>${tx}</code>` : null
+    ].filter(Boolean).join('\n');
+    console.log(msg.replace(/<[^>]+>/g, ''));
+    await tgNotify(msg);
+  } else {
+    console.log(`ℹ️ Nem 95%+: ${lpMint}${symbol ? ' ('+symbol+')' : ''}`);
   }
 }
 
-/* ======== START ======== */
-console.log(`LP burn poller indul… ${Number(POLL_MS)/1000}s-enként`);
-const timer = setInterval(poll, Number(POLL_MS));
+/* ===== WebSocket kliens ===== */
+function startWS() {
+  const ws = new WebSocket(PUMPPORTAL_WS);
+
+  ws.on('open', () => {
+    console.log('PumpPortal WS: open → feliratkozás:', PUMPPORTAL_METHOD);
+    // A PumpPortal egyszerű metódusneveket vár JSON-ban:
+    ws.send(JSON.stringify({ method: PUMPPORTAL_METHOD }));
+    // életjel (néhány szolgáltató igényli)
+    const pingInt = setInterval(() => {
+      try { ws.ping(); } catch {}
+    }, 30000);
+    ws.on('close', () => clearInterval(pingInt));
+  });
+
+  ws.on('message', async (buf) => {
+    const text = buf.toString();
+    try {
+      const data = JSON.parse(text);
+      // lehet lista vagy egyedi objektum:
+      const list = Array.isArray(data) ? data : (data.data || data.result || data.items || [data]);
+      for (const it of list) {
+        await handleMigrationEvent(it);
+      }
+    } catch (e) {
+      console.warn('WS parse hiba:', e.message, 'head=', text.slice(0, 200));
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error('PumpPortal WS error:', err.message);
+  });
+
+  ws.on('close', (code) => {
+    console.log('PumpPortal WS: close', code, '→ reconnect 3s');
+    setTimeout(startWS, 3000);
+  });
+}
+
+/* ===== Start ===== */
+console.log('LP burn figyelés indul (PumpPortal WebSocket)…');
+startWS();
 
 function shutdown() {
   console.log('Leállítás…');
-  clearInterval(timer);
   saveState();
   process.exit(0);
 }
