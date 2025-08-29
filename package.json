@@ -1,8 +1,8 @@
 {
   "name": "raydium-lp-burn-poller",
+  "version": "1.1.0",
   "type": "module",
-  "version": "1.0.0",
-  "description": "Raydium LP burn 95–100% incinerator arány polling + Telegram értesítés",
+  "description": "Raydium új LP-k polling + 95–100% incinerator arány ellenőrzés + Telegram értesítés",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
