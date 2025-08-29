@@ -1,9 +1,8 @@
 {
-  "name": "raydium-lp-burn-poller",
-  "version": "1.1.0",
+  "name": "lp-burn-ws",
+  "version": "1.0.0",
   "type": "module",
-  "description": "Raydium új LP-k polling + 95–100% incinerator arány ellenőrzés + Telegram értesítés",
-  "main": "index.js",
+  "description": "PumpPortal WS -> Raydium LP migrációk + 95–100% incinerator check + Telegram értesítés",
   "scripts": {
     "start": "node index.js"
   },
@@ -11,6 +10,7 @@
     "@solana/spl-token": "^0.4.7",
     "@solana/web3.js": "^1.95.3",
     "dotenv": "^16.4.5",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "ws": "^8.18.0"
   }
 }
