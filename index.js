@@ -63,6 +63,10 @@ const seenSet = new Set(state.seenLpMints || []);
 const burnedSet = new Set(state.burnedMints || []);
 const processedSigs = state.processedSigs || {}; // { programBase58: {sig:true} }
 function ensureProgSigSet(p) { if (!processedSigs[p]) processedSigs[p] = {}; return processedSigs[p]; }
+function trimProgSigSet(p, max = 2000) {
+  const set = processedSigs[p]; const keys = Object.keys(set);
+  if (keys.length > max) { for (let i = 0; i < keys.length - max; i++) delete set[keys[i]]; }
+}
 function saveState() {
   state.seenLpMints = Array.from(seenSet);
   state.burnedMints = Array.from(burnedSet);
@@ -227,6 +231,7 @@ async function pollProgram(programPk) {
         progSeen[sig] = true;
         await processParsedTx(programStr, sig, tx);
       }
+      trimProgSigSet(programStr);
     }
     state.lastSigPerProgram[programStr] = sigObjs[0].signature;
     saveState();
@@ -249,14 +254,20 @@ async function pollProgram(programPk) {
     progSeen[sig] = true;
     await processParsedTx(programStr, sig, tx);
   }
+  trimProgSigSet(programStr);
 
   state.lastSigPerProgram[programStr] = sigObjs[0].signature;
   saveState();
 }
 
-/* ===== Ciklus ===== */
+/* ===== Loop ===== */
 let baseDelayMs = Number(POLL_MS);
 let dynamicDelayMs = baseDelayMs;
+
+function jitter(ms, spread = 0.25) {
+  const d = ms * spread;
+  return Math.round(ms + (Math.random() * 2 - 1) * d);
+}
 
 async function pollAll() {
   try {
