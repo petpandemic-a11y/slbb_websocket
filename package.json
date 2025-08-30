@@ -1,8 +1,8 @@
 {
-  "name": "lp-burn-ws",
+  "name": "raydium-lp-burn-rpc-poller",
   "version": "1.0.0",
   "type": "module",
-  "description": "PumpPortal WS -> Raydium LP migrációk + 95–100% incinerator check + Telegram értesítés",
+  "description": "Raydium (CPMM/CLMM) új poolok RPC-polling + 95–100% incinerator ellenőrzés + Telegram",
   "scripts": {
     "start": "node index.js"
   },
@@ -10,7 +10,6 @@
     "@solana/spl-token": "^0.4.7",
     "@solana/web3.js": "^1.95.3",
     "dotenv": "^16.4.5",
-    "node-fetch": "^3.3.2",
-    "ws": "^8.18.0"
+    "node-fetch": "^3.3.2"
   }
 }
