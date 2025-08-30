@@ -13,13 +13,13 @@ const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   SIG_LIMIT = '10',
-  INITIAL_CATCHUP = '0',
+  INITIAL_CATCHUP = '5',
   VERBOSE = 'true'
 } = process.env;
 
 const verbose = String(VERBOSE).toLowerCase() === 'true';
 
-// RPC lista
+/* ===== RPC pool ===== */
 const RPCS = [RPC1 || SOLANA_RPC, RPC2, RPC3, RPC4].filter(u => u && /^https?:\/\//i.test(u));
 if (RPCS.length === 0) {
   console.error('❌ Nincs RPC megadva (RPC1 vagy SOLANA_RPC kötelező).');
@@ -27,16 +27,13 @@ if (RPCS.length === 0) {
 }
 let rpcIndex = 0;
 function nextConn() {
-  const url = RPCS[rpcIndex % RPCS.length];
-  rpcIndex++;
+  const url = RPCS[rpcIndex % RPCS.length]; rpcIndex++;
   console.log('🔌 Using RPC:', url.slice(0, 68) + (url.length > 68 ? '...' : ''));
   return new Connection(url, 'confirmed');
 }
 let conn = nextConn();
 
-const INCINERATOR = new PublicKey('1nc1nerator11111111111111111111111111111111');
-
-// Programok betöltése több ENV-ből
+/* ===== Programok több ENV-ből ===== */
 function loadProgramsFromEnv() {
   const arr = [];
   for (const [k, v] of Object.entries(process.env)) {
@@ -52,20 +49,24 @@ if (PROGRAMS.length === 0) {
   console.error('❌ Nincs RAYDIUM_PROGRAM* env beállítva.');
   process.exit(1);
 }
-
 console.log('✅ Programs =', PROGRAMS.map(p => p.toBase58()).join(', '));
 console.log('✅ POLL_MS =', POLL_MS, 'THRESHOLD =', THRESHOLD, 'SIG_LIMIT =', SIG_LIMIT, 'INITIAL_CATCHUP =', INITIAL_CATCHUP);
 
+const INCINERATOR = new PublicKey('1nc1nerator11111111111111111111111111111111');
+
 /* ===== State ===== */
 const STATE_FILE = './state.json';
-let state = { lastSigPerProgram: {}, seenLpMints: [], burnedMints: [] };
-try { if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')); }
+let state = { lastSigPerProgram: {}, seenLpMints: [], burnedMints: [], processedSigs: {} };
+try { if (fs.existsSync(STATE_FILE)) state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')) }; }
 catch (e) { console.warn('⚠️ State betöltés hiba:', e.message); }
 const seenSet = new Set(state.seenLpMints || []);
 const burnedSet = new Set(state.burnedMints || []);
+const processedSigs = state.processedSigs || {}; // { programBase58: {sig:true} }
+function ensureProgSigSet(p) { if (!processedSigs[p]) processedSigs[p] = {}; return processedSigs[p]; }
 function saveState() {
   state.seenLpMints = Array.from(seenSet);
   state.burnedMints = Array.from(burnedSet);
+  state.processedSigs = processedSigs;
   fs.writeFileSync(STATE_FILE, JSON.stringify(state));
 }
 
@@ -114,7 +115,7 @@ function findLpMintFromTx(tx) {
   return null;
 }
 
-/* ===== Rate limit kezelő ===== */
+/* ===== Rate-limit & helpers ===== */
 let baseDelayMs = Number(POLL_MS);
 let dynamicDelayMs = baseDelayMs;
 let lastWas429 = false;
@@ -138,7 +139,7 @@ async function safeGetSignatures(programPk, untilSig) {
     if (msg.includes('429') || msg.toLowerCase().includes('too many')) {
       lastWas429 = true;
       dynamicDelayMs = Math.min(dynamicDelayMs * 2, 120000);
-      console.warn(`⏳ 429 detected → backoff to ${dynamicDelayMs} ms, RPC rotate`);
+      console.warn(`⏳ 429 on getSignatures → backoff to ${dynamicDelayMs} ms, RPC rotate`);
       conn = nextConn();
       return [];
     }
@@ -147,31 +148,32 @@ async function safeGetSignatures(programPk, untilSig) {
   }
 }
 
-async function safeGetTransaction(sig) {
+async function safeGetParsedTransactions(sigs) {
   try {
-    return await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0 });
+    const txs = await conn.getParsedTransactions(sigs, { maxSupportedTransactionVersion: 0 });
+    lastWas429 = false;
+    return txs;
   } catch (e) {
     const msg = String(e?.message || e);
     if (msg.includes('429') || msg.toLowerCase().includes('too many')) {
       lastWas429 = true;
       dynamicDelayMs = Math.min(dynamicDelayMs * 2, 120000);
-      console.warn(`⏳ 429 on getTransaction → backoff to ${dynamicDelayMs} ms, RPC rotate`);
+      console.warn(`⏳ 429 on getParsedTransactions → backoff to ${dynamicDelayMs} ms, RPC rotate`);
       conn = nextConn();
-      return null;
+      return [];
     }
-    console.warn('⚠️ getTransaction error:', msg);
-    return null;
+    console.warn('⚠️ getParsedTransactions error:', msg);
+    return [];
   }
 }
 
-/* ===== Signature feldolgozó ===== */
-async function processSignature(programStr, s) {
-  const tx = await safeGetTransaction(s.signature);
+/* ===== Signature feldolgozó (tx objektummal) ===== */
+async function processParsedTx(programStr, sig, tx) {
   if (!tx || tx.meta?.err) return;
 
   const found = findLpMintFromTx(tx);
   if (!found) {
-    if (verbose) console.log(`• ${s.signature.slice(0,8)}…: no LP init`);
+    if (verbose) console.log(`• ${sig.slice(0,8)}…: no LP init`);
     return;
   }
 
@@ -190,48 +192,71 @@ async function processSignature(programStr, s) {
       '🔥 <b>100% LP burn confirmed</b>',
       `LP mint: <code>${lpMint}</code>`,
       `Program: ${programStr}`,
-      `Tx: <code>${s.signature}</code>`,
+      `Tx: <code>${sig}</code>`,
       `Detected by: ${reason}`
     ].join('\n');
     console.log(msg.replace(/<[^>]+>/g, ''));
     await tgNotify(msg);
   } else {
-    console.log(`ℹ️ Nem 95%+: ${lpMint} (prog: ${programStr}, tx: ${s.signature}, reason: ${reason})`);
+    console.log(`ℹ️ Nem 95%+: ${lpMint} (prog: ${programStr}, tx: ${sig}, reason: ${reason})`);
   }
 }
 
 /* ===== Poll ===== */
 async function pollProgram(programPk) {
   const programStr = programPk.toBase58();
+  const progSeen = ensureProgSigSet(programStr);
   const untilSig = state.lastSigPerProgram?.[programStr];
-  const sigs = await safeGetSignatures(programPk, untilSig);
-  if (sigs.length === 0) {
+
+  const sigObjs = await safeGetSignatures(programPk, untilSig);
+  if (sigObjs.length === 0) {
     if (verbose) console.log(`↪ Nincs új signature (${programStr.slice(0,6)}…)`);
     return;
   }
 
+  // Első kör: catchup
   if (!untilSig) {
-    const n = Math.min(Number(INITIAL_CATCHUP) || 0, sigs.length);
+    const n = Math.min(Number(INITIAL_CATCHUP) || 0, sigObjs.length);
     if (verbose) console.log(`🟡 First run for ${programStr.slice(0,6)}… — catchup=${n}`);
     if (n > 0) {
-      const toProcess = sigs.slice(0, n).reverse();
-      for (const s of toProcess) {
-        await processSignature(programStr, s);
+      const toProcess = sigObjs.slice(0, n).map(s => s.signature).reverse();
+      const txs = await safeGetParsedTransactions(toProcess);
+      for (let i = 0; i < toProcess.length; i++) {
+        const sig = toProcess[i];
+        const tx = txs?.[i];
+        progSeen[sig] = true;
+        await processParsedTx(programStr, sig, tx);
       }
     }
-    state.lastSigPerProgram[programStr] = sigs[0].signature;
+    state.lastSigPerProgram[programStr] = sigObjs[0].signature;
     saveState();
     return;
   }
 
-  for (const s of sigs.reverse()) {
-    await processSignature(programStr, s);
-    await new Promise(r => setTimeout(r, jitter(120)));
+  // Normál menet: csak az új, még nem feldolgozott sign-ek
+  const newSigs = sigObjs.map(s => s.signature).filter(sig => !progSeen[sig]).reverse();
+  if (newSigs.length === 0) {
+    if (verbose) console.log(`↪ Nincs feldolgozatlan új signature (${programStr.slice(0,6)}…)`);
+    state.lastSigPerProgram[programStr] = sigObjs[0].signature;
+    saveState();
+    return;
   }
 
-  state.lastSigPerProgram[programStr] = sigs[0].signature;
+  const txs = await safeGetParsedTransactions(newSigs);
+  for (let i = 0; i < newSigs.length; i++) {
+    const sig = newSigs[i];
+    const tx = txs?.[i];
+    progSeen[sig] = true;
+    await processParsedTx(programStr, sig, tx);
+  }
+
+  state.lastSigPerProgram[programStr] = sigObjs[0].signature;
   saveState();
 }
+
+/* ===== Ciklus ===== */
+let baseDelayMs = Number(POLL_MS);
+let dynamicDelayMs = baseDelayMs;
 
 async function pollAll() {
   try {
@@ -239,9 +264,7 @@ async function pollAll() {
       await pollProgram(p);
       await new Promise(r => setTimeout(r, jitter(250)));
     }
-    if (!lastWas429) {
-      dynamicDelayMs = Math.max(baseDelayMs, Math.floor(dynamicDelayMs * 0.8));
-    }
+    if (!lastWas429) dynamicDelayMs = Math.max(baseDelayMs, Math.floor(dynamicDelayMs * 0.8));
     saveState();
   } catch (e) {
     console.error('❌ Poll error:', e.message);
@@ -249,13 +272,12 @@ async function pollAll() {
   }
 }
 
-/* ===== Loop ===== */
 async function loop() {
   await pollAll();
   setTimeout(loop, dynamicDelayMs);
 }
 
-console.log('🚀 LP burn poller indul… adaptív backoff + catchup');
+console.log('🚀 LP burn poller indul… batch-elt getParsedTransactions + backoff');
 loop();
 
 /* ===== Shutdown ===== */
