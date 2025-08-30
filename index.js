@@ -14,7 +14,7 @@ const {
   TELEGRAM_CHAT_ID,
   SIG_LIMIT = '10',
   INITIAL_CATCHUP = '0',
-  VERBOSE = 'false'
+  VERBOSE = 'true'
 } = process.env;
 
 const verbose = String(VERBOSE).toLowerCase() === 'true';
