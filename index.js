@@ -4,10 +4,9 @@ import fetch from 'node-fetch';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { getAssociatedTokenAddress, getAccount, getMint } from '@solana/spl-token';
 
+/* ===== ENV ===== */
 const {
   SOLANA_RPC,
-  RAYDIUM_PROGRAMS =
-    'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C,CAMMCzo5YL8w4VFF8KVHRk22GGUsp5VTaW7girrKgIrwQk',
   POLL_MS = '10000',
   THRESHOLD = '0.95',
   TELEGRAM_BOT_TOKEN,
@@ -15,23 +14,45 @@ const {
 } = process.env;
 
 if (!SOLANA_RPC || !/^https?:\/\//i.test(SOLANA_RPC)) {
-  console.error('Hiba: SOLANA_RPC hiányzik vagy nem http/https:', SOLANA_RPC);
+  console.error('❌ Hiba: SOLANA_RPC hiányzik vagy nem http/https');
   process.exit(1);
 }
-const PROGRAMS = RAYDIUM_PROGRAMS.split(',').map(s => s.trim()).filter(Boolean).map(s => new PublicKey(s));
 
-console.log('RPC =', SOLANA_RPC.slice(0, 64) + '...');
-console.log('Raydium programs =', PROGRAMS.map(p => p.toBase58()).join(', '));
-console.log('POLL_MS =', POLL_MS, 'THRESHOLD =', THRESHOLD);
+/* ===== PROGRAM LIST több ENV-ből ===== */
+function loadProgramsFromEnv() {
+  const programs = [];
+  Object.entries(process.env).forEach(([key, val]) => {
+    if (key.startsWith('RAYDIUM_PROGRAM') && val) {
+      try {
+        programs.push(new PublicKey(val.trim()));
+      } catch (e) {
+        console.error(`❌ Hibás program ID (${key}):`, val, e.message);
+      }
+    }
+  });
+  return programs;
+}
+const PROGRAMS = loadProgramsFromEnv();
+if (PROGRAMS.length === 0) {
+  console.error('❌ Nincs egyetlen RAYDIUM_PROGRAM* env sem beállítva.');
+  process.exit(1);
+}
+
+console.log('✅ RPC =', SOLANA_RPC.slice(0, 64) + '...');
+console.log('✅ Raydium programs =', PROGRAMS.map(p => p.toBase58()).join(', '));
+console.log('✅ POLL_MS =', POLL_MS, 'THRESHOLD =', THRESHOLD);
 
 const conn = new Connection(SOLANA_RPC, 'confirmed');
 const INCINERATOR = new PublicKey('1nc1nerator11111111111111111111111111111111');
 
-/* ------ State ------ */
+/* ===== STATE ===== */
 const STATE_FILE = './state.json';
 let state = { lastSigPerProgram: {}, seenLpMints: [], burnedMints: [] };
-try { if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')); }
-catch (e) { console.warn('State betöltés hiba, tiszta indulás:', e.message); }
+try {
+  if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+} catch (e) {
+  console.warn('⚠️ State betöltés hiba, tiszta indulás:', e.message);
+}
 const seenSet = new Set(state.seenLpMints || []);
 const burnedSet = new Set(state.burnedMints || []);
 function saveState() {
@@ -40,17 +61,19 @@ function saveState() {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state));
 }
 
-/* ------ Telegram ------ */
+/* ===== Telegram ===== */
 async function tgNotify(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
     const body = { chat_id: TELEGRAM_CHAT_ID, text, disable_web_page_preview: true, parse_mode: 'HTML' };
     await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  } catch (e) { console.warn('Telegram hiba:', e.message); }
+  } catch (e) {
+    console.warn('⚠️ Telegram hiba:', e.message);
+  }
 }
 
-/* ------ Burn check ------ */
+/* ===== Burn check ===== */
 async function isLpBurned100Percent(lpMintStr, threshold = Number(THRESHOLD)) {
   const lpMint = new PublicKey(lpMintStr);
   const incAta = await getAssociatedTokenAddress(lpMint, INCINERATOR, true);
@@ -63,13 +86,15 @@ async function isLpBurned100Percent(lpMintStr, threshold = Number(THRESHOLD)) {
   try {
     const incAcc = await getAccount(conn, incAta);
     incBalRaw = BigInt(incAcc.amount.toString());
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 
   const ratio = Number(incBalRaw) / Number(supplyRaw);
   return ratio >= threshold;
 }
 
-/* ------ Tx parse ------ */
+/* ===== Tx parse ===== */
 function collectParsedInstructions(tx) {
   const outer = tx?.transaction?.message?.instructions || [];
   const inners = (tx?.meta?.innerInstructions || []).flatMap(ii => ii.instructions || []);
@@ -90,7 +115,7 @@ function findLpMintFromTx(tx) {
   return null;
 }
 
-/* ------ Poll core ------ */
+/* ===== Poll ===== */
 async function pollProgram(programPk) {
   const programStr = programPk.toBase58();
   const untilSig = state.lastSigPerProgram?.[programStr];
@@ -113,7 +138,7 @@ async function pollProgram(programPk) {
 
     let ok = false;
     try { ok = await isLpBurned100Percent(lpMint); }
-    catch (e) { console.warn('Burn check hiba', lpMint, e.message); }
+    catch (e) { console.warn('⚠️ Burn check hiba', lpMint, e.message); }
 
     if (ok && !burnedSet.has(lpMint)) {
       burnedSet.add(lpMint); saveState();
@@ -135,7 +160,6 @@ async function pollProgram(programPk) {
   saveState();
 }
 
-/* ------ Poll loop ------ */
 async function pollAll() {
   try {
     for (const p of PROGRAMS) {
@@ -143,15 +167,16 @@ async function pollAll() {
       await new Promise(r => setTimeout(r, 300));
     }
   } catch (e) {
-    console.error('Poll error:', e.message);
+    console.error('❌ Poll error:', e.message);
   }
 }
 
-console.log(`LP burn poller (RPC) indul… ${Number(POLL_MS)/1000}s-enként`);
+/* ===== START ===== */
+console.log(`🚀 LP burn poller (RPC) indul… ${Number(POLL_MS)/1000}s-enként`);
 const timer = setInterval(pollAll, Number(POLL_MS));
 
 function shutdown() {
-  console.log('Leállítás…');
+  console.log('⏹️ Leállítás…');
   clearInterval(timer);
   saveState();
   process.exit(0);
