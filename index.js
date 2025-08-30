@@ -119,7 +119,7 @@ function findLpMintFromTx(tx) {
 async function pollProgram(programPk) {
   const programStr = programPk.toBase58();
   const untilSig = state.lastSigPerProgram?.[programStr];
-  const sigs = await conn.getSignaturesForAddress(programPk, untilSig ? { until: untilSig, limit: 5 } : { limit: 40 });
+  const sigs = await conn.getSignaturesForAddress(programPk, untilSig ? { until: untilSig, limit: 5 } : { limit: 5 });
   if (sigs.length === 0) return;
 
   if (!untilSig) state.lastSigPerProgram[programStr] = sigs[0].signature;
