@@ -261,14 +261,6 @@ async function pollProgram(programPk) {
 }
 
 /* ===== Loop ===== */
-let baseDelayMs = Number(POLL_MS);
-let dynamicDelayMs = baseDelayMs;
-
-function jitter(ms, spread = 0.25) {
-  const d = ms * spread;
-  return Math.round(ms + (Math.random() * 2 - 1) * d);
-}
-
 async function pollAll() {
   try {
     for (const p of PROGRAMS) {
