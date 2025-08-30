@@ -14,6 +14,7 @@ const {
   TELEGRAM_CHAT_ID,
   SIG_LIMIT = '3',
   INITIAL_CATCHUP = '5',
+  PER_TX_DELAY_MS = '150',
   VERBOSE = 'true'
 } = process.env;
 
@@ -52,8 +53,6 @@ if (PROGRAMS.length === 0) {
 console.log('✅ Programs =', PROGRAMS.map(p => p.toBase58()).join(', '));
 console.log('✅ POLL_MS =', POLL_MS, 'THRESHOLD =', THRESHOLD, 'SIG_LIMIT =', SIG_LIMIT, 'INITIAL_CATCHUP =', INITIAL_CATCHUP);
 
-const INCINERATOR = new PublicKey('1nc1nerator11111111111111111111111111111111');
-
 /* ===== State ===== */
 const STATE_FILE = './state.json';
 let state = { lastSigPerProgram: {}, seenLpMints: [], burnedMints: [], processedSigs: {} };
@@ -85,6 +84,8 @@ async function tgNotify(text) {
 }
 
 /* ===== Burn check ===== */
+const INCINERATOR = new PublicKey('1nc1nerator11111111111111111111111111111111');
+
 async function isLpBurned100Percent(lpMintStr, threshold = Number(THRESHOLD)) {
   const lpMint = new PublicKey(lpMintStr);
   const incAta = await getAssociatedTokenAddress(lpMint, INCINERATOR, true);
@@ -152,26 +153,30 @@ async function safeGetSignatures(programPk, untilSig) {
   }
 }
 
-async function safeGetParsedTransactions(sigs) {
+async function safeGetParsedTransaction(sig) {
   try {
-    const txs = await conn.getParsedTransactions(sigs, { maxSupportedTransactionVersion: 0 });
+    const tx = await conn.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0 });
     lastWas429 = false;
-    return txs;
+    return tx;
   } catch (e) {
     const msg = String(e?.message || e);
     if (msg.includes('429') || msg.toLowerCase().includes('too many')) {
       lastWas429 = true;
       dynamicDelayMs = Math.min(dynamicDelayMs * 2, 120000);
-      console.warn(`⏳ 429 on getParsedTransactions → backoff to ${dynamicDelayMs} ms, RPC rotate`);
+      console.warn(`⏳ 429 on getParsedTransaction → backoff ${dynamicDelayMs} ms, RPC rotate`);
       conn = nextConn();
-      return [];
+      return null;
     }
-    console.warn('⚠️ getParsedTransactions error:', msg);
-    return [];
+    if (msg.includes('401') || msg.toLowerCase().includes('unauthorized')) {
+      console.warn('⚠️ 401 Unauthorized on getParsedTransaction (free tier?)');
+      return null;
+    }
+    console.warn('⚠️ getParsedTransaction error:', msg);
+    return null;
   }
 }
 
-/* ===== Signature feldolgozó (tx objektummal) ===== */
+/* ===== Signature feldolgozó ===== */
 async function processParsedTx(programStr, sig, tx) {
   if (!tx || tx.meta?.err) return;
 
@@ -224,12 +229,11 @@ async function pollProgram(programPk) {
     if (verbose) console.log(`🟡 First run for ${programStr.slice(0,6)}… — catchup=${n}`);
     if (n > 0) {
       const toProcess = sigObjs.slice(0, n).map(s => s.signature).reverse();
-      const txs = await safeGetParsedTransactions(toProcess);
-      for (let i = 0; i < toProcess.length; i++) {
-        const sig = toProcess[i];
-        const tx = txs?.[i];
+      for (const sig of toProcess) {
+        const tx = await safeGetParsedTransaction(sig);
         progSeen[sig] = true;
         await processParsedTx(programStr, sig, tx);
+        await new Promise(r => setTimeout(r, Number(PER_TX_DELAY_MS)));
       }
       trimProgSigSet(programStr);
     }
@@ -247,12 +251,11 @@ async function pollProgram(programPk) {
     return;
   }
 
-  const txs = await safeGetParsedTransactions(newSigs);
-  for (let i = 0; i < newSigs.length; i++) {
-    const sig = newSigs[i];
-    const tx = txs?.[i];
+  for (const sig of newSigs) {
+    const tx = await safeGetParsedTransaction(sig);
     progSeen[sig] = true;
     await processParsedTx(programStr, sig, tx);
+    await new Promise(r => setTimeout(r, Number(PER_TX_DELAY_MS)));
   }
   trimProgSigSet(programStr);
 
@@ -261,6 +264,9 @@ async function pollProgram(programPk) {
 }
 
 /* ===== Loop ===== */
+let baseDelayMs = Number(POLL_MS);
+let dynamicDelayMs = baseDelayMs;
+
 async function pollAll() {
   try {
     for (const p of PROGRAMS) {
@@ -280,7 +286,7 @@ async function loop() {
   setTimeout(loop, dynamicDelayMs);
 }
 
-console.log('🚀 LP burn poller indul… batch-elt getParsedTransactions + backoff');
+console.log('🚀 LP burn poller (free-tier) indul… egyesével getParsedTransaction + backoff');
 loop();
 
 /* ===== Shutdown ===== */
