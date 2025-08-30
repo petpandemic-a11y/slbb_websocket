@@ -1,78 +1,61 @@
 import 'dotenv/config';
 import fs from 'fs';
 import fetch from 'node-fetch';
-import WebSocket from 'ws';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { getAssociatedTokenAddress, getAccount, getMint } from '@solana/spl-token';
 
-/* ===== ENV ===== */
 const {
-  PUMPPORTAL_WS = 'wss://pumpportal.fun/api/data',
-  PUMPPORTAL_METHOD = 'subscribeMigration',
   SOLANA_RPC,
+  RAYDIUM_PROGRAMS =
+    'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C,CAMMCzo5YL8w4VFF8KVHRk22GGUsp5VTaW7girrKgIrwQk',
+  POLL_MS = '10000',
   THRESHOLD = '0.95',
   TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID,
+  TELEGRAM_CHAT_ID
 } = process.env;
 
-if (!/^wss?:\/\//i.test(PUMPPORTAL_WS)) {
-  console.error('Hiba: PUMPPORTAL_WS nincs beállítva vagy nem ws/wss URL:', PUMPPORTAL_WS);
-  process.exit(1);
-}
 if (!SOLANA_RPC || !/^https?:\/\//i.test(SOLANA_RPC)) {
   console.error('Hiba: SOLANA_RPC hiányzik vagy nem http/https:', SOLANA_RPC);
   process.exit(1);
 }
+const PROGRAMS = RAYDIUM_PROGRAMS.split(',').map(s => s.trim()).filter(Boolean).map(s => new PublicKey(s));
 
-console.log('PUMPPORTAL_WS =', PUMPPORTAL_WS);
-console.log('PUMPPORTAL_METHOD =', PUMPPORTAL_METHOD);
-console.log('SOLANA_RPC =', SOLANA_RPC.slice(0, 64) + '...');
-console.log('THRESHOLD =', THRESHOLD);
+console.log('RPC =', SOLANA_RPC.slice(0, 64) + '...');
+console.log('Raydium programs =', PROGRAMS.map(p => p.toBase58()).join(', '));
+console.log('POLL_MS =', POLL_MS, 'THRESHOLD =', THRESHOLD);
 
-/* ===== Állandók, állapot ===== */
-const INCINERATOR = new PublicKey('1nc1nerator11111111111111111111111111111111');
 const conn = new Connection(SOLANA_RPC, 'confirmed');
+const INCINERATOR = new PublicKey('1nc1nerator11111111111111111111111111111111');
 
+/* ------ State ------ */
 const STATE_FILE = './state.json';
-let state = { burnedMints: [], seenMints: [] };
-try {
-  if (fs.existsSync(STATE_FILE)) {
-    state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
-  }
-} catch (e) {
-  console.warn('State betöltés hiba, tiszta indulás:', e.message);
-}
+let state = { lastSigPerProgram: {}, seenLpMints: [], burnedMints: [] };
+try { if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')); }
+catch (e) { console.warn('State betöltés hiba, tiszta indulás:', e.message); }
+const seenSet = new Set(state.seenLpMints || []);
 const burnedSet = new Set(state.burnedMints || []);
-const seenSet = new Set(state.seenMints || []);
 function saveState() {
-  try {
-    state.burnedMints = Array.from(burnedSet);
-    state.seenMints = Array.from(seenSet);
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state));
-  } catch (e) {
-    console.warn('State mentés hiba:', e.message);
-  }
+  state.seenLpMints = Array.from(seenSet);
+  state.burnedMints = Array.from(burnedSet);
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state));
 }
 
-/* ===== Segédek ===== */
+/* ------ Telegram ------ */
 async function tgNotify(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
     const body = { chat_id: TELEGRAM_CHAT_ID, text, disable_web_page_preview: true, parse_mode: 'HTML' };
     await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  } catch (e) {
-    console.warn('Telegram hiba:', e.message);
-  }
+  } catch (e) { console.warn('Telegram hiba:', e.message); }
 }
-function pick(obj, ...keys) { for (const k of keys) { if (obj && obj[k] != null) return obj[k]; } }
 
-/* ===== LP burn ellenőrzés (incinerator arány) ===== */
+/* ------ Burn check ------ */
 async function isLpBurned100Percent(lpMintStr, threshold = Number(THRESHOLD)) {
   const lpMint = new PublicKey(lpMintStr);
   const incAta = await getAssociatedTokenAddress(lpMint, INCINERATOR, true);
 
-  const mintInfo = await getMint(conn, lpMint); // supply raw integer
+  const mintInfo = await getMint(conn, lpMint);
   const supplyRaw = BigInt(mintInfo.supply.toString());
   if (supplyRaw === 0n) return false;
 
@@ -80,103 +63,96 @@ async function isLpBurned100Percent(lpMintStr, threshold = Number(THRESHOLD)) {
   try {
     const incAcc = await getAccount(conn, incAta);
     incBalRaw = BigInt(incAcc.amount.toString());
-  } catch {
-    // nincs incinerator ATA -> biztos nem 95%+
-    return false;
-  }
+  } catch { return false; }
+
   const ratio = Number(incBalRaw) / Number(supplyRaw);
   return ratio >= threshold;
 }
 
-/* ===== Esemény kezelése a WS feedről ===== */
-async function handleMigrationEvent(ev) {
-  // a PumpPortal migration esemény formátuma szolgáltatófüggő,
-  // próbálunk rugalmasan mezőt találni:
-  const lpMint =
-    pick(ev, 'raydiumLpMint', 'raydium_lp_mint', 'lpMint', 'lp_mint', 'lp') ||
-    pick(ev?.data, 'raydiumLpMint', 'lpMint', 'lp');
-
-  if (!lpMint) {
-    console.log('⚠️ Eseményben nincs lpMint:', JSON.stringify(ev).slice(0, 240));
-    return;
-  }
-  if (seenSet.has(lpMint)) return; // már feldolgoztuk
-  seenSet.add(lpMint);
-  saveState();
-
-  const symbol = pick(ev, 'symbol', 'ticker', 'sym') || pick(ev?.data, 'symbol', 'ticker');
-  const name = pick(ev, 'name', 'tokenName') || pick(ev?.data, 'name', 'tokenName');
-  const tx = pick(ev, 'signature', 'sig', 'tx') || pick(ev?.data, 'signature', 'tx');
-
-  let ok = false;
-  try {
-    ok = await isLpBurned100Percent(lpMint);
-  } catch (e) {
-    console.warn('Check hiba', lpMint, e.message);
-    return;
-  }
-
-  if (ok && !burnedSet.has(lpMint)) {
-    burnedSet.add(lpMint);
-    saveState();
-    const msg = [
-      '🔥 <b>100% LP burn confirmed</b>',
-      symbol || name ? `Token: <b>${symbol || name}</b>` : null,
-      `LP mint: <code>${lpMint}</code>`,
-      tx ? `Tx: <code>${tx}</code>` : null
-    ].filter(Boolean).join('\n');
-    console.log(msg.replace(/<[^>]+>/g, ''));
-    await tgNotify(msg);
-  } else {
-    console.log(`ℹ️ Nem 95%+: ${lpMint}${symbol ? ' ('+symbol+')' : ''}`);
-  }
+/* ------ Tx parse ------ */
+function collectParsedInstructions(tx) {
+  const outer = tx?.transaction?.message?.instructions || [];
+  const inners = (tx?.meta?.innerInstructions || []).flatMap(ii => ii.instructions || []);
+  return [...outer, ...inners];
 }
-
-/* ===== WebSocket kliens ===== */
-function startWS() {
-  const ws = new WebSocket(PUMPPORTAL_WS);
-
-  ws.on('open', () => {
-    console.log('PumpPortal WS: open → feliratkozás:', PUMPPORTAL_METHOD);
-    // A PumpPortal egyszerű metódusneveket vár JSON-ban:
-    ws.send(JSON.stringify({ method: PUMPPORTAL_METHOD }));
-    // életjel (néhány szolgáltató igényli)
-    const pingInt = setInterval(() => {
-      try { ws.ping(); } catch {}
-    }, 30000);
-    ws.on('close', () => clearInterval(pingInt));
-  });
-
-  ws.on('message', async (buf) => {
-    const text = buf.toString();
-    try {
-      const data = JSON.parse(text);
-      // lehet lista vagy egyedi objektum:
-      const list = Array.isArray(data) ? data : (data.data || data.result || data.items || [data]);
-      for (const it of list) {
-        await handleMigrationEvent(it);
-      }
-    } catch (e) {
-      console.warn('WS parse hiba:', e.message, 'head=', text.slice(0, 200));
+function findLpMintFromTx(tx) {
+  for (const ins of collectParsedInstructions(tx)) {
+    if (ins?.program === 'spl-token' && ins?.parsed?.type === 'initializeMint') {
+      const mint = ins.parsed?.info?.mint;
+      if (mint) return { lpMint: mint, reason: 'spl-token.initializeMint' };
     }
-  });
-
-  ws.on('error', (err) => {
-    console.error('PumpPortal WS error:', err.message);
-  });
-
-  ws.on('close', (code) => {
-    console.log('PumpPortal WS: close', code, '→ reconnect 3s');
-    setTimeout(startWS, 3000);
-  });
+  }
+  const logs = (tx?.meta?.logMessages || []).join('\n');
+  if (/init|initialize|create/i.test(logs)) {
+    const mints = new Set((tx?.meta?.postTokenBalances || []).map(b => b.mint).filter(Boolean));
+    if (mints.size === 1) return { lpMint: [...mints][0], reason: 'heuristic.postTokenBalances' };
+  }
+  return null;
 }
 
-/* ===== Start ===== */
-console.log('LP burn figyelés indul (PumpPortal WebSocket)…');
-startWS();
+/* ------ Poll core ------ */
+async function pollProgram(programPk) {
+  const programStr = programPk.toBase58();
+  const untilSig = state.lastSigPerProgram?.[programStr];
+  const sigs = await conn.getSignaturesForAddress(programPk, untilSig ? { until: untilSig, limit: 40 } : { limit: 40 });
+  if (sigs.length === 0) return;
+
+  if (!untilSig) state.lastSigPerProgram[programStr] = sigs[0].signature;
+
+  for (const s of sigs.reverse()) {
+    const tx = await conn.getTransaction(s.signature, { maxSupportedTransactionVersion: 0 });
+    if (!tx || tx.meta?.err) continue;
+
+    const found = findLpMintFromTx(tx);
+    if (!found) continue;
+
+    const { lpMint, reason } = found;
+    if (!lpMint || seenSet.has(lpMint)) continue;
+    seenSet.add(lpMint);
+    saveState();
+
+    let ok = false;
+    try { ok = await isLpBurned100Percent(lpMint); }
+    catch (e) { console.warn('Burn check hiba', lpMint, e.message); }
+
+    if (ok && !burnedSet.has(lpMint)) {
+      burnedSet.add(lpMint); saveState();
+      const msg = [
+        '🔥 <b>100% LP burn confirmed</b>',
+        `LP mint: <code>${lpMint}</code>`,
+        `Program: ${programStr}`,
+        `Tx: <code>${s.signature}</code>`,
+        `Detected by: ${reason}`
+      ].join('\n');
+      console.log(msg.replace(/<[^>]+>/g, ''));
+      await tgNotify(msg);
+    } else {
+      console.log(`ℹ️ Nem 95%+: ${lpMint} (prog: ${programStr}, tx: ${s.signature}, reason: ${reason})`);
+    }
+  }
+
+  state.lastSigPerProgram[programStr] = sigs[0].signature;
+  saveState();
+}
+
+/* ------ Poll loop ------ */
+async function pollAll() {
+  try {
+    for (const p of PROGRAMS) {
+      await pollProgram(p);
+      await new Promise(r => setTimeout(r, 300));
+    }
+  } catch (e) {
+    console.error('Poll error:', e.message);
+  }
+}
+
+console.log(`LP burn poller (RPC) indul… ${Number(POLL_MS)/1000}s-enként`);
+const timer = setInterval(pollAll, Number(POLL_MS));
 
 function shutdown() {
   console.log('Leállítás…');
+  clearInterval(timer);
   saveState();
   process.exit(0);
 }
