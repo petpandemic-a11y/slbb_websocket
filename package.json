@@ -2,7 +2,6 @@
   "name": "raydium-lp-burn-rpc-poller",
   "version": "1.0.0",
   "type": "module",
-  "description": "Raydium (CPMM/CLMM) új poolok RPC-polling + 95–100% incinerator ellenőrzés + Telegram",
   "scripts": {
     "start": "node index.js"
   },
