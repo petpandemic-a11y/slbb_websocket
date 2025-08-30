@@ -8,11 +8,11 @@ import { getAssociatedTokenAddress, getAccount, getMint } from '@solana/spl-toke
 const {
   RPC1, RPC2, RPC3, RPC4,
   SOLANA_RPC,
-  POLL_MS = '10000',
+  POLL_MS = '30000',
   THRESHOLD = '0.95',
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
-  SIG_LIMIT = '10',
+  SIG_LIMIT = '3',
   INITIAL_CATCHUP = '5',
   VERBOSE = 'true'
 } = process.env;
