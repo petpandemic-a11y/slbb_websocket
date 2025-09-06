@@ -1,9 +1,10 @@
-// Raydium LP burn watcher → Telegram (STRICT, no-dup, young tokens)
-// - WS logsSubscribe: csak "Instruction: Burn" esetén kérünk le tx-t
+// Raydium LP burn watcher → Telegram (STRICT, no-dup, no-remove-liq, young tokens)
+// - WS logsSubscribe: csak "Instruction: Burn" esetén kérünk le tx-t, és KIZÁRJUK a RemoveLiquidity-hez köthető logokat
 // - Tokenkeg: Burn + a burn mintje a Raydium accounts közt (LP mint) → csak akkor jelzünk
+// - Kizáró feltétel 2.: ha a tx-ben Raydium vaultból base/quote transfer kifelé történik → remove liq → skip
 // - Min. LP burn % (MIN_LP_BURN_PCT), min. becsült SOL (MIN_SOL_BURN), max. token kor (MAX_TOKEN_AGE_MIN)
 // - Perzisztens dedup (signature) → nincs duplikált poszt
-// - TG üzenet: részletes formázás (név, ár, mcap, liq, security flagek stb.)
+// - TG üzenet: Token Mint + alap adatok
 
 import WebSocket from "ws";
 import http from "http";
@@ -141,7 +142,7 @@ async function fetchMetaplexMetadata(mint) {
   } catch { return null; }
 }
 
-// ===== Base58 util =====
+// ===== Base58 util (state scanhez) =====
 const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function bs58encode(buf){
   if (!buf || !buf.length) return "";
@@ -169,6 +170,7 @@ const SENT_FILE = "/tmp/sent_sigs.json";
 const SENT_TTL_MS = 48 * 60 * 60 * 1000; // 48h
 const SENT_MAX = 5000;
 let sentMap = new Map(); // sig -> ts
+
 function loadSent() {
   try {
     const raw = fs.readFileSync(SENT_FILE, "utf8");
@@ -181,7 +183,7 @@ function loadSent() {
 function saveSent() {
   try {
     const entries = [...sentMap.entries()];
-    entries.sort((a,b)=>a[1]-b[1]);
+    entries.sort((a,b)=>a[1]-b[1]); // oldest first
     const trimmed = entries.slice(Math.max(0, entries.length - SENT_MAX));
     fs.writeFileSync(SENT_FILE, JSON.stringify(trimmed), "utf8");
   } catch (e) { dbg("saveSent err:", e.message); }
@@ -226,6 +228,7 @@ async function enqueueSignature(sig){
   }
 }
 
+// ===== Utils =====
 function ago(tsMs){
   const s = Math.max(1, Math.floor((Date.now()-tsMs)/1000));
   if (s<60) return `${s}s ago`;
@@ -238,6 +241,7 @@ function ago(tsMs){
 function resolveMintsByBalanceDiff(tx, lpMint) {
   const pre = Array.isArray(tx?.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
   const post = Array.isArray(tx?.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
+
   const key = (b) => `${b?.accountIndex || 0}|${b?.mint || ""}`;
   const preMap = new Map(pre.map(b => [key(b), b]));
   const changes = [];
@@ -349,10 +353,39 @@ async function resolveMintsFallback(rayAccounts, lpMint){
   return { baseMint:null, quoteMint:null, source:"freq-none" };
 }
 
-// ===== TG üzenet összeállítása + feldolgozás =====
-let comboRemoveMap = new Map(); // sig -> true, ha ugyanabban a tx-ben RemoveLiquidity is volt
+// ===== Remove Liquidity detektálás (KIZÁRÁS) =====
+function hasRemoveLiquidityLogs(logsArr){
+  return logsArr.some(l =>
+    typeof l==="string" &&
+    ( /Remove\s*Liquidity/i.test(l)
+      || /RemoveLiquidity/i.test(l)
+      || /DecreaseLiquidity/i.test(l)
+      || /Withdraw/i.test(l) ) // óvatos: Raydium withdraw jellegű logok
+  );
+}
 
+// Tokenkeg transfer Raydium vaultból kifelé → remove liq jellegű tx
+function hasVaultOutflows(tx, rayAccounts, lpMint){
+  const top = tx?.transaction?.message?.instructions || [];
+  const inner = (tx?.meta?.innerInstructions || []).flatMap(x=>x?.instructions||[]);
+  const all = [...top, ...inner];
+  for (const ix of all){
+    if ((ix?.programId||"") !== TOKENKEG) continue;
+    const p = ix?.parsed;
+    if (!p || p?.type !== "transfer") continue;
+    const info = p?.info || {};
+    const source = info?.source;
+    const mint   = info?.mint || null; // jsonParsed transfer tartalmaz mintet
+    if (source && rayAccounts.has(source) && mint && mint !== lpMint) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ===== Main =====
 async function processSignature(sig){
+  // perzisztens dedup – ha már küldtük, skip
   if (sentMap.has(sig)) { dbg("skip already sent sig:", sig); return; }
 
   const tx = await getTransaction(sig);
@@ -377,6 +410,15 @@ async function processSignature(sig){
     const pk = typeof k === "string" ? k : (k?.pubkey || k?.toString?.());
     if (pk) rayAccounts.add(pk);
   }
+  dbg("rayAccounts count:", rayAccounts.size);
+
+  // --- LOG ALAPÚ KIZÁRÁS: Remove Liquidity? ---
+  const logsArr = Array.isArray(tx?.meta?.logMessages) ? tx.meta.logMessages
+                : Array.isArray(tx?.logs) ? tx.logs : [];
+  if (hasRemoveLiquidityLogs(logsArr)) {
+    dbg("skip: RemoveLiquidity pattern in logs");
+    return;
+  }
 
   // --- Tokenkeg Burn → LP mint (STRICT) ---
   let lpMint=null, burnAmountRaw=0;
@@ -387,12 +429,21 @@ async function processSignature(sig){
     if (!isBurn) continue;
     const cand = ix?.parsed?.info?.mint || ix?.mint;
     if (!cand) continue;
+
+    // STRICT: a burn-ölt mintnek Raydium accountokban kell szerepelnie
     if (!rayAccounts.has(cand)) { dbg("skip burn: mint not in Raydium accounts", cand); continue; }
+
     lpMint = cand;
     burnAmountRaw = Number(ix?.parsed?.info?.amount || ix?.amount || 0);
     break;
   }
   if (!lpMint){ dbg("no LP mint match (strict)"); return; }
+
+  // --- TOKEN FLOW ALAPÚ KIZÁRÁS: vault outflow? (remove liq gyanú) ---
+  if (hasVaultOutflows(tx, rayAccounts, lpMint)) {
+    dbg("skip: detected vault outflow transfers (remove liq)");
+    return;
+  }
 
   // --- LP supply + burn% ---
   let lpSupplyPost=0, lpDecimals=0;
@@ -405,7 +456,10 @@ async function processSignature(sig){
   const lpSupplyPre = lpSupplyPost + burnAmountRaw;
   const burnShare = lpSupplyPre>0 ? (burnAmountRaw/lpSupplyPre) : 0;
 
-  if (burnShare < MIN_LP_BURN_PCT){ dbg(`skip: burnShare ${(burnShare*100).toFixed(2)}% < min ${(MIN_LP_BURN_PCT*100).toFixed(2)}%`); return; }
+  if (burnShare < MIN_LP_BURN_PCT){
+    dbg(`skip: burnShare ${(burnShare*100).toFixed(2)}% < min ${(MIN_LP_BURN_PCT*100).toFixed(2)}%`);
+    return;
+  }
 
   // --- becsült SOL a poolból (WSOL vault) ---
   let wsolVaultRaw=0, wsolDecimals=9; let checked=0;
@@ -420,16 +474,19 @@ async function processSignature(sig){
     }
   }
   const estSolOut = burnShare * (wsolVaultRaw/Math.pow(10,wsolDecimals));
-  if (MIN_SOL_BURN>0 && estSolOut < MIN_SOL_BURN){ log(`skip (est SOL ${estSolOut.toFixed(4)} < min ${MIN_SOL_BURN}) sig=${sig}`); return; }
+  if (MIN_SOL_BURN>0 && estSolOut < MIN_SOL_BURN){
+    log(`skip (est SOL ${estSolOut.toFixed(4)} < min ${MIN_SOL_BURN}) sig=${sig}`);
+    return;
+  }
 
-  // --- Base/Quote mints feloldás ---
+  // --- Base/Quote mints feloldás (4 lépcső) – csak a base kell a tokenhez
   let res = resolveMintsByBalanceDiff(tx, lpMint);
   if (!res.baseMint){ const r1 = await resolveMintsFromState(rayAccounts, lpMint); if (r1.baseMint) res = r1; }
   if (!res.baseMint){ const r2 = await resolveMintsByLargestVaults(rayAccounts, lpMint); if (r2.baseMint) res = r2; }
   if (!res.baseMint){ const r3 = await resolveMintsFallback(rayAccounts, lpMint); if (r3.baseMint) res = r3; }
   const { baseMint } = res;
 
-  // Dexscreener a base minthez
+  // Dexscreener a base minthez (név/ár/mcap/liq + url + createdAt)
   let dx=null; if (baseMint) dx = await fetchDexscreenerByToken(baseMint);
 
   // --- Max token age szűrő ---
@@ -437,10 +494,13 @@ async function processSignature(sig){
     const createdAt = dx?.createdAt ? Number(dx.createdAt) : null;
     if (!createdAt) { dbg("skip: no pairCreatedAt (age unknown)"); return; }
     const ageMin = (Date.now() - createdAt) / 60000;
-    if (ageMin > MAX_TOKEN_AGE_MIN) { dbg(`skip: token age ${ageMin.toFixed(1)}min > max ${MAX_TOKEN_AGE_MIN}min`); return; }
+    if (ageMin > MAX_TOKEN_AGE_MIN) {
+      dbg(`skip: token age ${ageMin.toFixed(1)}min > max ${MAX_TOKEN_AGE_MIN}min`);
+      return;
+    }
   }
 
-  // --- opcionális security flag-ek ---
+  // --- opcionális security flag-ek (csak státuszhoz) ---
   let mintAuthNone=null, freezeNone=null, metaMutable=null;
   if (baseMint){
     try{
@@ -453,7 +513,7 @@ async function processSignature(sig){
     if (md){ metaMutable = md.isMutable; }
   }
 
-  // --- Üzenet (formázott) ---
+  // --- Üzenet (csak Token Mint) ---
   const link = `https://solscan.io/tx/${sig}`;
   const burnPct = (burnShare*100).toFixed(2);
   const burnAgo = tx?.blockTime ? ago(tx.blockTime*1000) : "n/a";
@@ -462,10 +522,9 @@ async function processSignature(sig){
   const liqStr  = dx?.liq!=null  ? `$${dx.liq.toLocaleString()}` : "n/a";
   const priceStr= dx?.price!=null? `$${dx.price}` : "n/a";
 
-  const comboNote = comboRemoveMap.get(sig) ? "(RemoveLiquidity in same tx)" : null;
-
   const lines = [
-    `🔥 <b>${headTitle}</b> ${comboNote?`<i>${comboNote}</i>`:""}`.trim(),
+    `Solana LP Burns`,
+    `<b>${headTitle}</b>`,
     "",
     `🔥 <b>Burn Percentage:</b> ${burnPct}%`,
     `🕒 <b>Burn Time:</b> ${burnAgo}`,
@@ -483,9 +542,10 @@ async function processSignature(sig){
     "",
     dx?.url ? dx.url : null,
     `🔗 <a href="${link}">Solscan</a>`,
-    DEBUG ? `\n<code>strict=1</code>` : null
+    DEBUG ? `\n<code>strict=1 no_remove_liq=1</code>` : null
   ].filter(Boolean);
 
+  // dedup: már most feljegyezzük
   sentMap.set(sig, Date.now());
   saveSent();
 
@@ -511,12 +571,16 @@ function connectWS(){
       const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
       if (!sig || logsArr.length===0) return;
 
-      // csak akkor, ha tényleg szerepel: "Instruction: Burn"
+      // 1) Csak ha tényleg szerepel: "Instruction: Burn"
       const hasBurnLog = logsArr.some(l => typeof l==="string" && /Instruction:\s*Burn\b/i.test(l));
-      const hasRemoveLog = logsArr.some(l => typeof l==="string" && /Instruction:\s*RemoveLiquidity\b/i.test(l));
-      if (!hasBurnLog) return; // RemoveLiquidity önmagában nem megy át
+      if (!hasBurnLog) return;
 
-      if (hasRemoveLog) comboRemoveMap.set(sig, true); // megjelöljük, hogy combo volt
+      // 2) Kizárás: RemoveLiquidity / Withdraw jellegű logok
+      if (hasRemoveLiquidityLogs(logsArr)) {
+        dbg("WS skip: RemoveLiquidity pattern");
+        return;
+      }
+
       await enqueueSignature(sig);
     }catch(e){ log("WS msg err:", e.message); }
   };
