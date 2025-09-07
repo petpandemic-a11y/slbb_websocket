@@ -1,10 +1,31 @@
-// Raydium LP burn watcher → Telegram (STRICT, no-dup, no-remove-liq, young tokens)
-// - WS logsSubscribe: csak "Instruction: Burn" esetén kérünk le tx-t, és KIZÁRJUK a RemoveLiquidity-hez köthető logokat
-// - Tokenkeg: Burn + a burn mintje a Raydium accounts közt (LP mint) → csak akkor jelzünk
-// - Kizáró feltétel 2.: ha a tx-ben Raydium vaultból base/quote transfer kifelé történik → remove liq → skip
-// - Min. LP burn % (MIN_LP_BURN_PCT), min. becsült SOL (MIN_SOL_BURN), max. token kor (MAX_TOKEN_AGE_MIN)
-// - Perzisztens dedup (signature) → nincs duplikált poszt
-// - TG üzenet: Token Mint + alap adatok
+// Raydium LP Burn Watcher (whitelist-based, remove-liq safe, debuggable)
+// Focus: ONLY real SPL burns where the burned mint is a Raydium LP mint (AMM v4 / CPMM / StableSwap).
+// Changes:
+//  - Adds Raydium LP whitelist loader (liquidity/mainnet.json) -> lpMintSet
+//  - Makes "RemoveLiquidity logs" exclusion optional via env (REMOVE_LIQ_LOG_BLOCK=1 to enable; default OFF)
+//  - Keeps vault-outflow exclusion but makes it optional via env (STRICT_VAULT_OUTFLOW=1 to enable; default ON)
+//  - Adds rich debug logs for skip reasons
+//  - Keeps rate limiter, dedup, Telegram formatting
+//
+// ENV (typical):
+//  PORT=8080
+//  RPC_HTTP=...  RPC_WSS=...
+//  TG_BOT_TOKEN=... TG_CHAT_ID=...
+//  MIN_SOL_BURN=0                # estimated SOL threshold
+//  MIN_LP_BURN_PCT=0.95          # 0.95 = 95% default; raise/lower as needed
+//  MAX_TOKEN_AGE_MIN=0           # 0=off
+//  RATE_MS=1200                  # getTransaction throttle
+//  DEBUG=1
+//  # new:
+//  REMOVE_LIQ_LOG_BLOCK=0        # 1 => skip tx if RemoveLiquidity-like logs; 0 => just log it (default 0)
+//  STRICT_VAULT_OUTFLOW=1        # 1 => skip tx if vault outflow detected (default 1)
+//  RAY_LP_LIST_URL=https://api.raydium.io/v2/sdk/liquidity/mainnet.json
+//
+// Notes:
+//  - CLMM is intentionally ignored for LP-burn: no fungible LP mint, it's position NFTs.
+//  - Whitelist refreshes hourly. On failure, the previous set remains.
+//  - If lpMintSet is empty at boot (e.g., network issue), we still proceed but log a big WARNING.
+//
 
 import WebSocket from "ws";
 import http from "http";
@@ -16,20 +37,28 @@ const RPC_HTTP = process.env.RPC_HTTP || "https://api.mainnet-beta.solana.com";
 const RPC_WSS  = process.env.RPC_WSS  || "wss://api.mainnet-beta.solana.com";
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
-const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);         // becsült SOL a poolból (WSOL vault alapján)
-const MIN_LP_BURN_PCT = Number(process.env.MIN_LP_BURN_PCT || 0.99); // 0.99 = 99%
-const MAX_TOKEN_AGE_MIN = Number(process.env.MAX_TOKEN_AGE_MIN || 0); // 0 = kikapcsolva
+
+const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);
+const MIN_LP_BURN_PCT = Number(process.env.MIN_LP_BURN_PCT || 0.95);
+const MAX_TOKEN_AGE_MIN = Number(process.env.MAX_TOKEN_AGE_MIN || 0);
+
 const DEBUG = process.env.DEBUG === "1";
 const RATE_MS = Number(process.env.RATE_MS || 1200);
+
+// new feature flags
+const REMOVE_LIQ_LOG_BLOCK = process.env.REMOVE_LIQ_LOG_BLOCK === "1"; // default off
+const STRICT_VAULT_OUTFLOW = process.env.STRICT_VAULT_OUTFLOW !== "0"; // default on
+const RAY_LP_LIST_URL = process.env.RAY_LP_LIST_URL || "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
 
 // ===== Program IDs =====
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const RAY_CPMM   = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+const RAY_STABLE = "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h";
 const TOKENKEG   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const WSOL_MINT  = "So11111111111111111111111111111111111111112";
 const METAPLEX_META = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 
-// Gyakori quote mint-ek
+// Quote mints (for info purposes)
 const QUOTE_MINTS = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
@@ -87,7 +116,7 @@ async function tokenAccountInfo(pubkey){
   return d?.type === "account" ? d?.info : null;
 }
 
-// ===== Dexscreener =====
+// ===== Dexscreener (optional info) =====
 async function fetchDexscreenerByToken(mint){
   try{
     const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { headers:{accept:"application/json"} });
@@ -95,7 +124,6 @@ async function fetchDexscreenerByToken(mint){
     const j = await r.json();
     const pairs = Array.isArray(j?.pairs) ? j.pairs : [];
     if (!pairs.length) return null;
-    // prefer Raydium + nagy likvid
     pairs.sort((a,b)=>{
       const ra = (a?.dexId||"").toLowerCase()==="raydium" ? 0 : 1;
       const rb = (b?.dexId||"").toLowerCase()==="raydium" ? 0 : 1;
@@ -116,33 +144,7 @@ async function fetchDexscreenerByToken(mint){
   }catch(e){ dbg("dexs err:", e.message); return null; }
 }
 
-// ===== Metaplex metadata (opcionális státusz) =====
-async function fetchMetaplexMetadata(mint) {
-  try {
-    const accs = await getProgramAccounts(METAPLEX_META, [{ memcmp: { offset: 1 + 32, bytes: mint } }]);
-    if (!Array.isArray(accs) || accs.length === 0) return null;
-    const dataB64 = accs[0]?.account?.data?.[0];
-    if (!dataB64) return null;
-    const buf = Buffer.from(dataB64, "base64");
-    let o = 0;
-    const readU8  = () => buf[o++];
-    const readU16 = () => { const v = buf.readUInt16LE(o); o+=2; return v; };
-    const readU32 = () => { const v = buf.readUInt32LE(o); o+=4; return v; };
-    const readStr = () => { const len = readU32(); const s = buf.slice(o, o+len).toString("utf8"); o += len; return s; };
-    const skipPk = () => { o += 32; };
-    readU8(); skipPk(); skipPk(); // key + updateAuth + mint
-    const name   = readStr().trim();
-    const symbol = readStr().trim();
-    readStr(); readU16();
-    const hasCreators = readU8();
-    if (hasCreators === 1) { const n = readU32(); for (let i=0;i<n;i++){ skipPk(); readU8(); readU8(); } }
-    readU8();
-    const isMutable = !!readU8();
-    return { name, symbol, isMutable };
-  } catch { return null; }
-}
-
-// ===== Base58 util (state scanhez) =====
+// ===== Base58 util =====
 const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function bs58encode(buf){
   if (!buf || !buf.length) return "";
@@ -213,7 +215,7 @@ async function sendTelegram(text){
   tgSending=false;
 }
 
-// ===== Rate limiter a getTransaction-hoz =====
+// ===== Rate limiter for getTransaction =====
 const sigQueue=[]; const seenSig=new Set(); let workerRunning=false;
 async function enqueueSignature(sig){
   if (seenSig.has(sig)) return; seenSig.add(sig); sigQueue.push(sig);
@@ -237,134 +239,42 @@ function ago(tsMs){
   const d = Math.floor(h/24); return `${d} days ago`;
 }
 
-// ===== 1) Balance diff → base/quote jelölt =====
-function resolveMintsByBalanceDiff(tx, lpMint) {
-  const pre = Array.isArray(tx?.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
-  const post = Array.isArray(tx?.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
-
-  const key = (b) => `${b?.accountIndex || 0}|${b?.mint || ""}`;
-  const preMap = new Map(pre.map(b => [key(b), b]));
-  const changes = [];
-  for (const b of post) {
-    const k = key(b);
-    const p = preMap.get(k);
-    const mint = b?.mint;
-    if (!mint || mint === lpMint) continue;
-    const dec = Number(b?.uiTokenAmount?.decimals || 0);
-    const postAmt = Number(b?.uiTokenAmount?.amount || 0);
-    const preAmt  = Number(p?.uiTokenAmount?.amount || 0);
-    const diffRaw = postAmt - preAmt;
-    const diffAbs = Math.abs(diffRaw) / (10 ** dec);
-    if (diffAbs > 0) changes.push({ mint, diffAbs });
+// ===== Whitelist loader (Raydium LP mints) =====
+let lpMintSet = new Set();
+async function loadRaydiumLpMints() {
+  try {
+    const r = await fetch(RAY_LP_LIST_URL);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const lists = [
+      ...(Array.isArray(j?.official) ? j.official : []),
+      ...(Array.isArray(j?.unOfficial) ? j.unOfficial : []),
+    ];
+    const mints = lists
+      .map(p => p?.lpMint || p?.lp?.mint || p?.lp_mint)
+      .filter(Boolean);
+    if (mints.length === 0) throw new Error("empty mint list");
+    lpMintSet = new Set(mints);
+    log(`[Raydium] LP mints loaded: ${lpMintSet.size}`);
+  } catch (e) {
+    log(`[Raydium] LP list load FAILED: ${e.message}. Using previous set size=${lpMintSet.size}`);
   }
-  const byMint = new Map();
-  for (const c of changes) byMint.set(c.mint, (byMint.get(c.mint) || 0) + c.diffAbs);
-  const ranked = [...byMint.entries()].sort((a,b)=>b[1]-a[1]);
-  if (ranked.length >= 2) {
-    const [m1, m2] = ranked.slice(0,2).map(x=>x[0]);
-    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint: m2, quoteMint: m1, source: "baldiff" };
-    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint: m1, quoteMint: m2, source: "baldiff" };
-    return { baseMint: m1, quoteMint: m2, source: "baldiff" };
-  }
-  return { baseMint: null, quoteMint: null, source: "baldiff-none" };
 }
+loadRaydiumLpMints();
+setInterval(loadRaydiumLpMints, 60 * 60 * 1000); // hourly
 
-// ===== 2) Pool state RAW → 32B kulcsok scannelése =====
-async function resolveMintsFromState(rayAccounts, lpMint) {
-  const stateCandidates = [];
-  for (const acc of rayAccounts) {
-    try{
-      const info = await getAccountInfoRaw(acc);
-      const owner = info?.value?.owner;
-      if (owner === RAY_AMM_V4 || owner === RAY_CPMM) {
-        const b64 = info?.value?.data?.[0];
-        if (b64) stateCandidates.push(Buffer.from(b64, "base64"));
-      }
-      if (stateCandidates.length >= 6) break;
-    }catch{}
-  }
-  for (const buf of stateCandidates) {
-    const seen = new Set();
-    const found = [];
-    for (let off = 0; off + 32 <= buf.length; off++) {
-      const pk = bs58encode(buf.slice(off, off + 32));
-      if (seen.has(pk)) continue; seen.add(pk);
-      if (pk.length < 32 || pk.length > 44) continue;
-      if (pk === lpMint) continue;
-      const mintInfo = await isMintAccount(pk);
-      if (mintInfo) {
-        found.push(pk);
-        if (found.length > 4) break;
-      }
-    }
-    const uniq = [...new Set(found)];
-    if (uniq.length === 2) {
-      const [m1, m2] = uniq;
-      if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"state" };
-      if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"state" };
-      return { baseMint:m1, quoteMint:m2, source:"state" };
-    }
-  }
-  return { baseMint:null, quoteMint:null, source:"state-none" };
-}
-
-// ===== 3) Largest vaults =====
-async function resolveMintsByLargestVaults(rayAccounts, lpMint){
-  const vaults = [];
-  let checked = 0;
-  for (const a of rayAccounts){
-    if (checked++ > 300) break;
-    const ta = await tokenAccountInfo(a);
-    if (!ta) continue;
-    const mint = ta?.mint;
-    if (!mint || mint === lpMint) continue;
-    const amt = Number(ta?.tokenAmount?.amount || 0);
-    vaults.push({ mint, amt });
-  }
-  vaults.sort((a,b)=>b.amt - a.amt);
-  const top = vaults.slice(0, 6);
-  const uniqMints = [...new Set(top.map(v=>v.mint))];
-  if (uniqMints.length >= 2){
-    const [m1, m2] = uniqMints.slice(0,2);
-    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"largest" };
-    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"largest" };
-    return { baseMint:m1, quoteMint:m2, source:"largest" };
-  }
-  return { baseMint:null, quoteMint:null, source:"largest-none" };
-}
-
-// ===== 4) Fallback: vault mint frekvencia =====
-async function resolveMintsFallback(rayAccounts, lpMint){
-  const freq = new Map();
-  let checked = 0;
-  for (const a of rayAccounts){
-    if (checked++ > 300) break;
-    const ta = await tokenAccountInfo(a);
-    const m = ta?.mint;
-    if (m && m !== lpMint) freq.set(m, (freq.get(m)||0) + 1);
-  }
-  const sorted = [...freq.entries()].sort((a,b)=>b[1]-a[1]).map(x=>x[0]);
-  if (sorted.length >= 2){
-    const [m1,m2] = sorted.slice(0,2);
-    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"freq" };
-    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"freq" };
-    return { baseMint:m1, quoteMint:m2, source:"freq" };
-  }
-  return { baseMint:null, quoteMint:null, source:"freq-none" };
-}
-
-// ===== Remove Liquidity detektálás (KIZÁRÁS) =====
+// ===== Remove Liquidity detection (optional SKIP) =====
 function hasRemoveLiquidityLogs(logsArr){
   return logsArr.some(l =>
     typeof l==="string" &&
     ( /Remove\s*Liquidity/i.test(l)
       || /RemoveLiquidity/i.test(l)
       || /DecreaseLiquidity/i.test(l)
-      || /Withdraw/i.test(l) ) // óvatos: Raydium withdraw jellegű logok
+      || /Withdraw\b/i.test(l) )
   );
 }
 
-// Tokenkeg transfer Raydium vaultból kifelé → remove liq jellegű tx
+// Tokenkeg transfer out of Raydium vaults => remove-liq like tx
 function hasVaultOutflows(tx, rayAccounts, lpMint){
   const top = tx?.transaction?.message?.instructions || [];
   const inner = (tx?.meta?.innerInstructions || []).flatMap(x=>x?.instructions||[]);
@@ -375,7 +285,7 @@ function hasVaultOutflows(tx, rayAccounts, lpMint){
     if (!p || p?.type !== "transfer") continue;
     const info = p?.info || {};
     const source = info?.source;
-    const mint   = info?.mint || null; // jsonParsed transfer tartalmaz mintet
+    const mint   = info?.mint || null;
     if (source && rayAccounts.has(source) && mint && mint !== lpMint) {
       return true;
     }
@@ -385,7 +295,7 @@ function hasVaultOutflows(tx, rayAccounts, lpMint){
 
 // ===== Main =====
 async function processSignature(sig){
-  // perzisztens dedup – ha már küldtük, skip
+  // persistent dedup
   if (sentMap.has(sig)) { dbg("skip already sent sig:", sig); return; }
 
   const tx = await getTransaction(sig);
@@ -395,8 +305,8 @@ async function processSignature(sig){
   const inner = (tx?.meta?.innerInstructions || []).flatMap(x=>x?.instructions||[]);
   const all = [...top, ...inner];
 
-  // --- Raydium accountok összegyűjtése ---
-  const rayPrograms = new Set([RAY_AMM_V4, RAY_CPMM]);
+  // Raydium accounts seen in tx
+  const rayPrograms = new Set([RAY_AMM_V4, RAY_CPMM, RAY_STABLE]);
   const rayAccounts = new Set();
   for (const ix of all){
     const pid = typeof ix?.programId==="string" ? ix.programId : null;
@@ -412,15 +322,19 @@ async function processSignature(sig){
   }
   dbg("rayAccounts count:", rayAccounts.size);
 
-  // --- LOG ALAPÚ KIZÁRÁS: Remove Liquidity? ---
+  // RemoveLiquidity logs handling (optional block)
   const logsArr = Array.isArray(tx?.meta?.logMessages) ? tx.meta.logMessages
                 : Array.isArray(tx?.logs) ? tx.logs : [];
   if (hasRemoveLiquidityLogs(logsArr)) {
-    dbg("skip: RemoveLiquidity pattern in logs");
-    return;
+    if (REMOVE_LIQ_LOG_BLOCK) {
+      dbg("skip: RemoveLiquidity pattern (LOG BLOCK ON)");
+      return;
+    } else {
+      dbg("HAS RemoveLiquidity-like logs, but not skipping (LOG BLOCK OFF)");
+    }
   }
 
-  // --- Tokenkeg Burn → LP mint (STRICT) ---
+  // Find a Tokenkeg Burn and ensure the burned mint is a known Raydium LP mint
   let lpMint=null, burnAmountRaw=0;
   for (const ix of all){
     const pid = typeof ix?.programId==="string" ? ix.programId : null;
@@ -430,22 +344,26 @@ async function processSignature(sig){
     const cand = ix?.parsed?.info?.mint || ix?.mint;
     if (!cand) continue;
 
-    // STRICT: a burn-ölt mintnek Raydium accountokban kell szerepelnie
-    if (!rayAccounts.has(cand)) { dbg("skip burn: mint not in Raydium accounts", cand); continue; }
-
+    // LP whitelist gate
+    if (lpMintSet.size === 0) {
+      log("[WARN] lpMintSet empty; accepting burn candidates for now:", cand);
+    } else if (!lpMintSet.has(cand)) {
+      dbg("skip burn: mint not in Raydium LP whitelist", cand);
+      continue;
+    }
     lpMint = cand;
     burnAmountRaw = Number(ix?.parsed?.info?.amount || ix?.amount || 0);
     break;
   }
-  if (!lpMint){ dbg("no LP mint match (strict)"); return; }
+  if (!lpMint){ dbg("no LP mint burn found (after whitelist check)"); return; }
 
-  // --- TOKEN FLOW ALAPÚ KIZÁRÁS: vault outflow? (remove liq gyanú) ---
-  if (hasVaultOutflows(tx, rayAccounts, lpMint)) {
-    dbg("skip: detected vault outflow transfers (remove liq)");
+  // Optional: vault outflow exclusion
+  if (STRICT_VAULT_OUTFLOW && hasVaultOutflows(tx, rayAccounts, lpMint)) {
+    dbg("skip: detected vault outflow transfers (remove-liq like, STRICT_VAULT_OUTFLOW=1)");
     return;
   }
 
-  // --- LP supply + burn% ---
+  // LP supply + burn% check
   let lpSupplyPost=0, lpDecimals=0;
   try{
     const mi = await getParsedCached(lpMint);
@@ -456,12 +374,16 @@ async function processSignature(sig){
   const lpSupplyPre = lpSupplyPost + burnAmountRaw;
   const burnShare = lpSupplyPre>0 ? (burnAmountRaw/lpSupplyPre) : 0;
 
+  if (!isFinite(burnShare) || burnShare <= 0){
+    dbg("skip: invalid burnShare", burnShare);
+    return;
+  }
   if (burnShare < MIN_LP_BURN_PCT){
     dbg(`skip: burnShare ${(burnShare*100).toFixed(2)}% < min ${(MIN_LP_BURN_PCT*100).toFixed(2)}%`);
     return;
   }
 
-  // --- becsült SOL a poolból (WSOL vault) ---
+  // Estimate SOL value from WSOL vault (optional heuristic)
   let wsolVaultRaw=0, wsolDecimals=9; let checked=0;
   for (const a of rayAccounts){
     if (checked++>120) break;
@@ -479,17 +401,42 @@ async function processSignature(sig){
     return;
   }
 
-  // --- Base/Quote mints feloldás (4 lépcső) – csak a base kell a tokenhez
-  let res = resolveMintsByBalanceDiff(tx, lpMint);
-  if (!res.baseMint){ const r1 = await resolveMintsFromState(rayAccounts, lpMint); if (r1.baseMint) res = r1; }
-  if (!res.baseMint){ const r2 = await resolveMintsByLargestVaults(rayAccounts, lpMint); if (r2.baseMint) res = r2; }
-  if (!res.baseMint){ const r3 = await resolveMintsFallback(rayAccounts, lpMint); if (r3.baseMint) res = r3; }
-  const { baseMint } = res;
+  // Resolve base token (best-effort heuristics via balance-diff on non-LP mints)
+  function resolveBaseMintViaBalances(tx, lpMint) {
+    const pre = Array.isArray(tx?.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
+    const post = Array.isArray(tx?.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
+    const key = (b) => `${b?.accountIndex || 0}|${b?.mint || ""}`;
+    const preMap = new Map(pre.map(b => [key(b), b]));
+    const changes = [];
+    for (const b of post) {
+      const k = key(b);
+      const p = preMap.get(k);
+      const mint = b?.mint;
+      if (!mint || mint === lpMint) continue;
+      const dec = Number(b?.uiTokenAmount?.decimals || 0);
+      const postAmt = Number(b?.uiTokenAmount?.amount || 0);
+      const preAmt  = Number(p?.uiTokenAmount?.amount || 0);
+      const diffRaw = postAmt - preAmt;
+      const diffAbs = Math.abs(diffRaw) / (10 ** dec);
+      if (diffAbs > 0) changes.push({ mint, diffAbs });
+    }
+    const byMint = new Map();
+    for (const c of changes) byMint.set(c.mint, (byMint.get(c.mint) || 0) + c.diffAbs);
+    const ranked = [...byMint.entries()].sort((a,b)=>b[1]-a[1]);
+    if (ranked.length >= 2) {
+      const [m1, m2] = ranked.slice(0,2).map(x=>x[0]);
+      if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return m2;
+      if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return m1;
+      return m1;
+    }
+    return ranked[0]?.[0] || null;
+  }
+  const baseMint = resolveBaseMintViaBalances(tx, lpMint);
 
-  // Dexscreener a base minthez (név/ár/mcap/liq + url + createdAt)
+  // Dexscreener info (best effort)
   let dx=null; if (baseMint) dx = await fetchDexscreenerByToken(baseMint);
 
-  // --- Max token age szűrő ---
+  // Optional token age filter
   if (MAX_TOKEN_AGE_MIN > 0) {
     const createdAt = dx?.createdAt ? Number(dx.createdAt) : null;
     if (!createdAt) { dbg("skip: no pairCreatedAt (age unknown)"); return; }
@@ -500,20 +447,7 @@ async function processSignature(sig){
     }
   }
 
-  // --- opcionális security flag-ek (csak státuszhoz) ---
-  let mintAuthNone=null, freezeNone=null, metaMutable=null;
-  if (baseMint){
-    try{
-      const mi = await getParsedCached(baseMint);
-      const info = mi?.value?.data?.parsed?.info;
-      mintAuthNone = (info?.mintAuthority===null || info?.mintAuthority===undefined);
-      freezeNone   = (info?.freezeAuthority===null || info?.freezeAuthority===undefined);
-    }catch{}
-    const md = await fetchMetaplexMetadata(baseMint);
-    if (md){ metaMutable = md.isMutable; }
-  }
-
-  // --- Üzenet (csak Token Mint) ---
+  // Build TG message
   const link = `https://solscan.io/tx/${sig}`;
   const burnPct = (burnShare*100).toFixed(2);
   const burnAgo = tx?.blockTime ? ago(tx.blockTime*1000) : "n/a";
@@ -525,27 +459,21 @@ async function processSignature(sig){
   const lines = [
     `Solana LP Burns`,
     `<b>${headTitle}</b>`,
-    "",
+    ``,
     `🔥 <b>Burn Percentage:</b> ${burnPct}%`,
     `🕒 <b>Burn Time:</b> ${burnAgo}`,
-    "",
+    ``,
     `📊 <b>Marketcap:</b> ${mcapStr}`,
     `💧 <b>Liquidity:</b> ${liqStr}`,
     `💲 <b>Price:</b> ${priceStr}`,
-    "",
+    ``,
     baseMint ? `🧾 <b>Token Mint:</b> <code>${baseMint}</code>` : `🧾 <b>Token Mint:</b> n/a`,
-    "",
-    `⚙️ <b>Security:</b>`,
-    `├ Mutable Metadata: ${metaMutable===null ? "n/a" : (metaMutable ? "Yes ❌" : "No ✅")}`,
-    `├ Mint Authority: ${mintAuthNone===null ? "n/a" : (mintAuthNone ? "No ✅" : "Yes ❌")}`,
-    `└ Freeze Authority: ${freezeNone===null ? "n/a" : (freezeNone ? "No ✅" : "Yes ❌")}`,
-    "",
-    dx?.url ? dx.url : null,
+    ``,
     `🔗 <a href="${link}">Solscan</a>`,
-    DEBUG ? `\n<code>strict=1 no_remove_liq=1</code>` : null
+    DEBUG ? `\n<code>wl=${lpMintSet.size} rlq=${REMOVE_LIQ_LOG_BLOCK?1:0} vlo=${STRICT_VAULT_OUTFLOW?1:0}</code>` : null
   ].filter(Boolean);
 
-  // dedup: már most feljegyezzük
+  // dedup record now
   sentMap.set(sig, Date.now());
   saveSent();
 
@@ -562,7 +490,12 @@ function subscribeLogs(programId, id){
 function connectWS(){
   log("WS connecting", RPC_WSS);
   ws = new WebSocket(RPC_WSS);
-  ws.onopen = () => { log("WS open"); subscribeLogs(RAY_AMM_V4,1001); subscribeLogs(RAY_CPMM,1002); };
+  ws.onopen = () => { 
+    log("WS open"); 
+    subscribeLogs(RAY_AMM_V4,1001); 
+    subscribeLogs(RAY_CPMM,1002); 
+    subscribeLogs(RAY_STABLE,1003); 
+  };
   ws.onmessage = async (ev)=>{
     try{
       const data = JSON.parse(ev.data.toString());
@@ -571,16 +504,11 @@ function connectWS(){
       const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
       if (!sig || logsArr.length===0) return;
 
-      // 1) Csak ha tényleg szerepel: "Instruction: Burn"
+      // Must contain Instruction: Burn (Token program)
       const hasBurnLog = logsArr.some(l => typeof l==="string" && /Instruction:\s*Burn\b/i.test(l));
       if (!hasBurnLog) return;
 
-      // 2) Kizárás: RemoveLiquidity / Withdraw jellegű logok
-      if (hasRemoveLiquidityLogs(logsArr)) {
-        dbg("WS skip: RemoveLiquidity pattern");
-        return;
-      }
-
+      // Remove-liq logs handling is deferred to processSignature (we don't skip here)
       await enqueueSignature(sig);
     }catch(e){ log("WS msg err:", e.message); }
   };
