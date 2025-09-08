@@ -1,5 +1,8 @@
 // index.js
-// Node 18+ (ESM). Raydium LP burn/incinerator watcher (Helius WS + Dexscreener + TG)
+// Node 18+ (ESM). Raydium LP burn/incinerator watcher
+// Kettős feliratkozás: logsSubscribe(Token program) + transactionSubscribe(ALL)
+// + Keepalive, heartbeat, backoff, Raydium LP cache (background),
+//   incinerator + SPL Burn detektálás, Dexscreener, rövid DEBUG logok.
 
 import WebSocket from "ws";
 import { PublicKey } from "@solana/web3.js";
@@ -174,7 +177,7 @@ async function handleHit({ type, mint, amount, sig, tsSec }) {
   if (DEBUG) console.log("--- DEBUG END ---\n");
 }
 
-// ── WebSocket (keepalive + heartbeat + backoff) ───────────────────────────────
+// ── WebSocket (logsSubscribe + transactionSubscribe ALL) ───────────────────────
 function startWs() {
   const url = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
   let backoffMs = 1000;
@@ -202,24 +205,24 @@ function startWs() {
       backoffMs = 1000;
       lastMsgTs = Date.now();
 
-      const sub = {
+      // 1) Token program logs (mindig jön valami)
+      ws.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
+        method: "logsSubscribe",
+        params: [{ mentions: [TOKEN_PROGRAM_ID], commitment: "confirmed" }, { encoding: "jsonParsed" }]
+      }));
+      // 2) Minden tranzakció (ALL) – lokálisan szűrünk
+      ws.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
         method: "transactionSubscribe",
-        params: [
-          {
-            commitment: "confirmed",
-            accountInclude: [TOKEN_PROGRAM_ID] // minden SPL tx jön → lokálisan szűrünk
-          },
-          { encoding: "jsonParsed" }
-        ]
-      };
-      ws.send(JSON.stringify(sub));
+        params: [{ commitment: "confirmed" }, { encoding: "jsonParsed" }]
+      }));
+      console.log("[SUB] logsSubscribe(Token) + transactionSubscribe(ALL)");
 
       // keepalive ping 20s
-      pingTimer = setInterval(() => {
-        try { ws.ping(); } catch {}
-      }, 20000);
+      pingTimer = setInterval(() => { try { ws.ping(); } catch {} }, 20000);
 
       // heartbeat 60s
       heartbeatTimer = setInterval(() => {
@@ -235,22 +238,32 @@ function startWs() {
     ws.on("pong", () => { /* noop */ });
 
     ws.on("message", async raw => {
-      lastMsgTs = Date.now();
       try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.method !== "transactionNotification") return;
-        const tx = msg?.params?.result;
+        const data = JSON.parse(raw.toString());
+
+        // A) LOGS stream rövid jelzés (hogy "mit néz")
+        if (data.method === "logsNotification") {
+          lastMsgTs = Date.now();
+          const logs = data.params?.result?.value?.logs || [];
+          const sig  = data.params?.result?.value?.signature || "";
+          if (DEBUG) console.log(`[CHECK logs] sig=${sig} lines=${logs.length}`);
+          return; // csak jelzés; hit-ek a transactionNotification ágon
+        }
+
+        // B) TRANSACTION stream – itt dolgozunk
+        if (data.method !== "transactionNotification") return;
+        lastMsgTs = Date.now();
+
+        const tx = data?.params?.result;
         const sig = tx?.signature;
         const tsSec = tx?.timestamp;
 
         const hits = [];
 
-        // tokenTransfers → incinerator ATA
+        // tokenTransfers → incinerator ATA (rövid log)
         for (const t of tx.tokenTransfers || []) {
           const { mint, toTokenAccount, tokenAmount } = t || {};
-          if (DEBUG) {
-            console.log(`[CHECK tokenTransfer] sig=${sig} mint=${mint} to=${toTokenAccount} amt=${tokenAmount}`);
-          }
+          if (DEBUG) console.log(`[CHECK tokenTransfer] sig=${sig} mint=${mint} to=${toTokenAccount} amt=${tokenAmount}`);
           if (!mint) continue;
 
           if (raydiumLpSet.size && !raydiumLpSet.has(mint)) continue;
@@ -265,11 +278,9 @@ function startWs() {
           }
         }
 
-        // SPL Burn
+        // SPL Burn (rövid log)
         for (const i of tx.instructions || []) {
-          if (DEBUG) {
-            console.log(`[CHECK instr] sig=${sig} prog=${i.programId} type=${i.parsed?.type} mint=${i.parsed?.info?.mint}`);
-          }
+          if (DEBUG) console.log(`[CHECK instr] sig=${sig} prog=${i.programId} type=${i.parsed?.type} mint=${i.parsed?.info?.mint}`);
           if (i.programId === TOKEN_PROGRAM_ID && i.parsed?.type === "burn") {
             const mint = i.parsed?.info?.mint;
             if (!mint) continue;
@@ -286,6 +297,7 @@ function startWs() {
           await handleHit({ ...h, sig, tsSec });
         }
 
+        // dedupe prune
         if (seen.size > 50000) {
           const keep = Array.from(seen).slice(-20000);
           seen.clear();
@@ -310,6 +322,7 @@ function startWs() {
 
     ws.on("error", (err) => {
       if (DEBUG) console.log("WS error:", err?.message || String(err));
+      // close handler will reconnect
     });
   };
 
