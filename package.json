@@ -1,14 +1,37 @@
 {
-  "name": "raydium-lp-burn-rpc-poller",
+  "name": "raydium-lp-burn-monitor",
   "version": "1.0.0",
+  "description": "Real-time Raydium LP burn monitor with Telegram notifications",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "solana",
+    "raydium",
+    "lp-burn",
+    "monitoring",
+    "websocket",
+    "telegram-bot"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "@solana/spl-token": "^0.4.7",
-    "@solana/web3.js": "^1.95.3",
+    "@solana/web3.js": "^1.95.4",
+    "@solana/spl-token": "^0.4.8",
     "dotenv": "^16.4.5",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "express": "^4.21.1",
+    "winston": "^3.14.2",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
   }
 }
