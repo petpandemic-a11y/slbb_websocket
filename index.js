@@ -22,7 +22,7 @@ const config = {
     MIN_LP_BURN_PCT: parseFloat(process.env.MIN_LP_BURN_PCT || '0.99'),
     MIN_SOL_BURN: parseFloat(process.env.MIN_SOL_BURN || '0'),
     PORT: parseInt(process.env.PORT || '8080'),
-    RATE_MS: parseInt(process.env.RATE_MS || '12000'),
+    RATE_MS: parseInt(process.env.RATE_MS || '30000'), // Increased to 30 seconds
     RPC_HTTP: process.env.RPC_HTTP,
     RPC_WSS: process.env.RPC_WSS,
     TG_BOT_TOKEN: process.env.TG_BOT_TOKEN,
@@ -278,7 +278,14 @@ class RaydiumLPBurnMonitor {
             this.detectedBurns.set(signature, true);
             
             // Add exponential backoff for rate limiting
-            const retryDelay = Math.min(config.RATE_MS * Math.pow(2, this.retryCount || 0), 60000);
+            const baseDelay = config.RATE_MS;
+            const retryCount = this.retryCount || 0;
+            const retryDelay = Math.min(baseDelay * Math.pow(2, retryCount), 120000); // Max 2 minutes
+            
+            if (retryCount > 0) {
+                logger.warn(`Rate limited, waiting ${retryDelay}ms before retry (attempt ${retryCount + 1})...`);
+            }
+            
             await this.sleep(retryDelay);
             
             // Fetch transaction with retry logic
@@ -296,19 +303,31 @@ class RaydiumLPBurnMonitor {
                     this.retryCount = 0;
                     
                 } catch (error) {
-                    if (error.message?.includes('429') || error.message?.includes('Too Many Requests')) {
-                        logger.warn(`Rate limited, waiting ${retryDelay}ms before retry...`);
+                    const errorMessage = error.message || error.toString();
+                    
+                    if (errorMessage.includes('429') || errorMessage.includes('Too Many Requests')) {
                         this.retryCount = (this.retryCount || 0) + 1;
-                        await this.sleep(retryDelay * 2);
+                        const waitTime = Math.min(baseDelay * Math.pow(2, this.retryCount), 120000);
+                        logger.warn(`Rate limit hit, waiting ${waitTime}ms before retry...`);
+                        await this.sleep(waitTime);
+                        retries--;
+                    } else if (errorMessage.includes('timeout')) {
+                        logger.warn(`Timeout fetching tx, retrying...`);
+                        await this.sleep(5000);
                         retries--;
                     } else {
-                        throw error;
+                        logger.error(`Error fetching tx: ${errorMessage}`);
+                        // Remove from processed to retry later
+                        this.detectedBurns.delete(signature);
+                        return;
                     }
                 }
             }
             
             if (!tx || !tx.meta) {
                 logger.debug(`No transaction data for: ${signature}`);
+                // Remove from processed to retry later
+                this.detectedBurns.delete(signature);
                 return;
             }
             
@@ -331,95 +350,112 @@ class RaydiumLPBurnMonitor {
      * Extract burn information from transaction
      */
     async extractBurnInfo(tx) {
-        const { meta, transaction } = tx;
-        
-        if (!meta.postTokenBalances || !meta.preTokenBalances) {
-            return null;
-        }
-        
-        const burnInfo = {
-            tokenMint: null,
-            burnAmount: 0,
-            burnPercentage: 0,
-            burner: null,
-            poolId: null,
-            timestamp: tx.blockTime,
-            solValue: 0,
-            isLPToken: false
-        };
-        
-        // Check if this involves Raydium
-        const hasRaydiumProgram = transaction.message.accountKeys.some(key => 
-            key.toBase58() === '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8' ||
-            key.toBase58() === 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK' ||
-            key.toBase58() === 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C'
-        );
-        
-        // Find LP token burns
-        for (let i = 0; i < meta.preTokenBalances.length; i++) {
-            const pre = meta.preTokenBalances[i];
-            const post = meta.postTokenBalances.find(p => 
-                p.accountIndex === pre.accountIndex
-            );
+        try {
+            if (!tx || !tx.meta) {
+                return null;
+            }
             
-            if (!post) continue;
+            const { meta, transaction } = tx;
             
-            const preAmount = BigInt(pre.uiTokenAmount.amount || 0);
-            const postAmount = BigInt(post.uiTokenAmount.amount || 0);
+            if (!meta.postTokenBalances || !meta.preTokenBalances) {
+                return null;
+            }
             
-            // Check if this is a burn (transfer to burn address)
-            if (BURN_ADDRESSES.includes(post.owner) && postAmount > preAmount) {
-                // Tokens received at burn address
-                const burnAmount = postAmount - preAmount;
+            const burnInfo = {
+                tokenMint: null,
+                burnAmount: 0,
+                burnPercentage: 0,
+                burner: null,
+                poolId: null,
+                timestamp: tx.blockTime,
+                solValue: 0,
+                isLPToken: false
+            };
+            
+            // Safely check for Raydium programs
+            let hasRaydiumProgram = false;
+            if (transaction?.message?.accountKeys) {
+                hasRaydiumProgram = transaction.message.accountKeys.some(key => {
+                    if (!key || !key.toBase58) return false;
+                    const keyStr = key.toBase58();
+                    return keyStr === '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8' ||
+                           keyStr === 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK' ||
+                           keyStr === 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
+                });
+            }
+            
+            // Find LP token burns
+            for (let i = 0; i < meta.preTokenBalances.length; i++) {
+                const pre = meta.preTokenBalances[i];
+                if (!pre || !pre.uiTokenAmount) continue;
                 
-                burnInfo.tokenMint = pre.mint;
-                burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals);
-                
-                // Check if this is an LP token
-                burnInfo.isLPToken = await this.isLPToken(pre.mint, tx);
-                
-                // Find the sender
-                const sender = meta.preTokenBalances.find(b => 
-                    b.mint === pre.mint && 
-                    !BURN_ADDRESSES.includes(b.owner) &&
-                    BigInt(b.uiTokenAmount.amount) >= burnAmount
+                const post = meta.postTokenBalances.find(p => 
+                    p && p.accountIndex === pre.accountIndex
                 );
                 
-                if (sender) {
-                    burnInfo.burner = sender.owner;
+                if (!post || !post.uiTokenAmount) continue;
+                
+                const preAmount = BigInt(pre.uiTokenAmount.amount || 0);
+                const postAmount = BigInt(post.uiTokenAmount.amount || 0);
+                
+                // Check if this is a burn (transfer to burn address)
+                if (post.owner && BURN_ADDRESSES.includes(post.owner) && postAmount > preAmount) {
+                    // Tokens received at burn address
+                    const burnAmount = postAmount - preAmount;
                     
-                    // Calculate burn percentage
-                    const senderPreAmount = BigInt(sender.uiTokenAmount.amount || 0);
-                    if (senderPreAmount > 0n) {
-                        burnInfo.burnPercentage = Number(burnAmount) / Number(senderPreAmount);
+                    burnInfo.tokenMint = pre.mint;
+                    burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
+                    
+                    // Check if this is an LP token
+                    burnInfo.isLPToken = await this.isLPToken(pre.mint, tx);
+                    
+                    // Find the sender
+                    const sender = meta.preTokenBalances.find(b => 
+                        b && b.mint === pre.mint && 
+                        b.owner && !BURN_ADDRESSES.includes(b.owner) &&
+                        BigInt(b.uiTokenAmount?.amount || 0) >= burnAmount
+                    );
+                    
+                    if (sender && sender.owner) {
+                        burnInfo.burner = sender.owner;
+                        
+                        // Calculate burn percentage
+                        const senderPreAmount = BigInt(sender.uiTokenAmount?.amount || 0);
+                        if (senderPreAmount > 0n) {
+                            burnInfo.burnPercentage = Number(burnAmount) / Number(senderPreAmount);
+                        }
                     }
+                }
+                
+                // Alternative: Check for direct burns (amount decrease to 0)
+                if (preAmount > 0n && postAmount === 0n && pre.owner && !BURN_ADDRESSES.includes(pre.owner)) {
+                    const burnAmount = preAmount;
+                    
+                    burnInfo.tokenMint = pre.mint;
+                    burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
+                    burnInfo.burner = pre.owner;
+                    burnInfo.burnPercentage = 1.0; // 100% burn
+                    burnInfo.isLPToken = await this.isLPToken(pre.mint, tx);
                 }
             }
             
-            // Alternative: Check for direct burns (amount decrease to 0)
-            if (preAmount > 0n && postAmount === 0n && !BURN_ADDRESSES.includes(pre.owner)) {
-                const burnAmount = preAmount;
-                
-                burnInfo.tokenMint = pre.mint;
-                burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals);
-                burnInfo.burner = pre.owner;
-                burnInfo.burnPercentage = 1.0; // 100% burn
-                burnInfo.isLPToken = await this.isLPToken(pre.mint, tx);
+            // Only return if it's an LP token or involves Raydium
+            if (!burnInfo.isLPToken && !hasRaydiumProgram) {
+                return null;
             }
-        }
-        
-        // Only return if it's an LP token or involves Raydium
-        if (!burnInfo.isLPToken && !hasRaydiumProgram) {
+            
+            // Try to identify pool
+            burnInfo.poolId = await this.identifyPool(tx);
+            
+            // Estimate SOL value
+            burnInfo.solValue = await this.estimateSolValue(burnInfo);
+            
+            return burnInfo.tokenMint ? burnInfo : null;
+            
+        } catch (error) {
+            logger.error(`Error extracting burn info: ${error.message}`);
             return null;
         }
-        
-        // Try to identify pool
-        burnInfo.poolId = await this.identifyPool(tx);
-        
-        // Estimate SOL value
-        burnInfo.solValue = await this.estimateSolValue(burnInfo);
-        
-        return burnInfo.tokenMint ? burnInfo : null;
     }
     
     /**
@@ -463,25 +499,39 @@ class RaydiumLPBurnMonitor {
      * Identify pool from transaction
      */
     async identifyPool(tx) {
-        const instructions = tx.transaction.message.instructions || [];
-        
-        for (const ix of instructions) {
-            const programId = tx.transaction.message.accountKeys[ix.programIdIndex];
+        try {
+            if (!tx?.transaction?.message?.instructions) {
+                return null;
+            }
             
-            // Check if Raydium instruction
-            if (programId && (
-                programId.equals(RAYDIUM_LIQUIDITY_POOL_V4) ||
-                programId.equals(RAYDIUM_AMM_PROGRAM) ||
-                programId.equals(RAYDIUM_CPMM_PROGRAM)
-            )) {
-                // First account is usually the pool
-                if (ix.accounts && ix.accounts.length > 0) {
-                    return tx.transaction.message.accountKeys[ix.accounts[0]].toBase58();
+            const instructions = tx.transaction.message.instructions;
+            
+            for (const ix of instructions) {
+                if (!ix || typeof ix.programIdIndex === 'undefined') continue;
+                
+                const accountKeys = tx.transaction.message.accountKeys;
+                if (!accountKeys || !accountKeys[ix.programIdIndex]) continue;
+                
+                const programId = accountKeys[ix.programIdIndex];
+                
+                // Check if Raydium instruction
+                if (programId && programId.equals && (
+                    programId.equals(RAYDIUM_LIQUIDITY_POOL_V4) ||
+                    programId.equals(RAYDIUM_AMM_PROGRAM) ||
+                    programId.equals(RAYDIUM_CPMM_PROGRAM)
+                )) {
+                    // First account is usually the pool
+                    if (ix.accounts && ix.accounts.length > 0 && accountKeys[ix.accounts[0]]) {
+                        return accountKeys[ix.accounts[0]].toBase58();
+                    }
                 }
             }
+            
+            return null;
+        } catch (error) {
+            logger.debug(`Error identifying pool: ${error.message}`);
+            return null;
         }
-        
-        return null;
     }
 
     /**
