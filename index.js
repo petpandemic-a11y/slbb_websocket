@@ -1,19 +1,10 @@
-// Raydium LP burn watcher → Telegram (strict, no remove liq, base/quote resolve)
-// - WS logsSubscribe: csak "Instruction: Burn", de remove/withdraw log kiszűrve
-// - Strict LP mint: Burn mintnek Raydium accountok között kell lennie (csak Ray ix-ekből)
-// - Vault outflow check: ha base/quote vaultból kiáramlás van → skip
+// Raydium LP burn watcher → Telegram (strict, no-dup, young tokens)
+// - WS logsSubscribe: csak "Instruction: Burn" esetén
+// - Strict LP mint: Burn mintnek Raydium accountok között kell lennie
 // - Min LP burn % szűrő (MIN_LP_BURN_PCT)
 // - Max token age szűrő Dexscreener pairCreatedAt alapján (MAX_TOKEN_AGE_MIN)
 // - Perzisztens dedup (signature) → nincs duplikált poszt
-// - TG formátum: Token Mint + alap adatok + security + dexs link
-//
-// ENV tippek (Render):
-// MIN_LP_BURN_PCT=0.99
-// MAX_TOKEN_AGE_MIN=60
-// MIN_SOL_BURN=0
-// MAX_VAULT_OUTFLOW=0.001
-// RATE_MS=1000
-// DEBUG=0/1
+// - TG formátum: csak Token Mint (contract) + alap adatok
 
 import WebSocket from "ws";
 import http from "http";
@@ -28,9 +19,8 @@ const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
 const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);         // becsült SOL a poolból (WSOL vault alapján)
 const MIN_LP_BURN_PCT = Number(process.env.MIN_LP_BURN_PCT || 0.99); // 0.99 = 99%+
 const MAX_TOKEN_AGE_MIN = Number(process.env.MAX_TOKEN_AGE_MIN || 60); // csak ennel fiatalabb tokenek (percek)
-const MAX_VAULT_OUTFLOW = Number(process.env.MAX_VAULT_OUTFLOW || 0.001); // token egység (mintenként)
 const DEBUG = process.env.DEBUG === "1";
-const RATE_MS = Number(process.env.RATE_MS || 1000); // 1000 = 1 mp/tx
+const RATE_MS = Number(process.env.RATE_MS || 1000); // 2000 = 2 mp/tx
 
 // ===== Program IDs =====
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -240,18 +230,10 @@ async function enqueueSignature(sig){
 // ===== Utils =====
 function ago(tsMs){
   const s = Math.max(1, Math.floor((Date.now()-tsMs)/1000));
-  if (s<60) return `${s}s ago`; const m = Math.floor(s/60);
-  if (m<60) return `${m} minutes ago`; const h = Math.floor(m/60);
-  if (h<24) return `${h} hours ago`; const d = Math.floor(h/24);
-  return `${d} days ago`;
-}
-
-// ===== Remove-liquidity log detektor =====
-function hasRemoveLogs(logsArr){
-  return logsArr?.some?.(l =>
-    typeof l==="string" &&
-    /remove\s*liquidity|withdraw\s*liquidity|RemoveLiquidity/i.test(l)
-  ) || false;
+  if (s<60) return `${s}s ago`;
+  const m = Math.floor(s/60); if (m<60) return `${m} minutes ago`;
+  const h = Math.floor(m/60); if (h<24) return `${h} hours ago`;
+  const d = Math.floor(h/24); return `${d} days ago`;
 }
 
 // ===== 1) Base/quote mints balance-diffből =====
@@ -375,49 +357,6 @@ async function resolveMintsFallback(rayAccounts, lpMint){
   return { baseMint:null, quoteMint:null, source:"freq-none" };
 }
 
-// ===== Vault outflow by mint =====
-function outflowByMint(tx, rayAccountsSet) {
-  const pre = tx?.meta?.preTokenBalances || [];
-  const post = tx?.meta?.postTokenBalances || [];
-  const keys = tx?.transaction?.message?.accountKeys || [];
-  const idxToPk = i => {
-    const k = keys[i];
-    return typeof k === "string" ? k : (k?.pubkey || k?.toString?.());
-  };
-  const map = new Map();
-  for (const b of pre) {
-    const pk = idxToPk(b?.accountIndex);
-    if (!pk) continue;
-    map.set(pk, {
-      pre: Number(b?.uiTokenAmount?.amount || 0),
-      post: 0,
-      mint: b?.mint,
-      dec: Number(b?.uiTokenAmount?.decimals || 0)
-    });
-  }
-  for (const b of post) {
-    const pk = idxToPk(b?.accountIndex);
-    if (!pk) continue;
-    const rec = map.get(pk) || {
-      pre: 0, post: 0,
-      mint: b?.mint,
-      dec: Number(b?.uiTokenAmount?.decimals || 0)
-    };
-    rec.post = Number(b?.uiTokenAmount?.amount || 0);
-    map.set(pk, rec);
-  }
-  const byMint = new Map(); // mint -> outflowAbs (token egység)
-  for (const [pk, rec] of map.entries()) {
-    if (!rayAccountsSet.has(pk)) continue;
-    const rawDiff = rec.post - rec.pre; // negatív: outflow
-    if (rawDiff < 0) {
-      const absUnits = (-rawDiff) / Math.pow(10, rec.dec || 0);
-      byMint.set(rec.mint, (byMint.get(rec.mint) || 0) + absUnits);
-    }
-  }
-  return byMint;
-}
-
 // ===== Main =====
 async function processSignature(sig){
   // perzisztens dedup – ha már küldtük, skip
@@ -430,11 +369,7 @@ async function processSignature(sig){
   const inner = (tx?.meta?.innerInstructions || []).flatMap(x=>x?.instructions||[]);
   const all = [...top, ...inner];
 
-  // --- Remove-liquidity log szűrés (biztonság kedvéért még itt is) ---
-  const logMsgs = Array.isArray(tx?.meta?.logMessages) ? tx.meta.logMessages : [];
-  if (hasRemoveLogs(logMsgs)) { dbg("skip: remove-liq logs"); return; }
-
-  // --- Raydium accountok összegyűjtése (CSAK Ray ix-ekből) ---
+  // --- Raydium accountok összegyűjtése ---
   const rayPrograms = new Set([RAY_AMM_V4, RAY_CPMM]);
   const rayAccounts = new Set();
   for (const ix of all){
@@ -444,10 +379,18 @@ async function processSignature(sig){
       for (const a of accs) rayAccounts.add(a);
     }
   }
+  const msgKeys = tx?.transaction?.message?.accountKeys || [];
+  for (const k of msgKeys) {
+    const pk = typeof k === "string" ? k : (k?.pubkey || k?.toString?.());
+    if (pk) rayAccounts.add(pk);
+  }
   dbg("rayAccounts count:", rayAccounts.size);
 
-  // --- Tokenkeg Burn → LP mint (STRICT) ---
+  // --- Tokenkeg Burn → LP mint (Ray tx required, relaxed) ---
   let lpMint=null, burnAmountRaw=0;
+  const hasRayIx = rayAccounts.size > 0;
+  if (!hasRayIx){ dbg("skip: no Ray ix present"); return; }
+
   for (const ix of all){
     const pid = typeof ix?.programId==="string" ? ix.programId : null;
     if (pid!==TOKENKEG) continue;
@@ -455,13 +398,14 @@ async function processSignature(sig){
     if (!isBurn) continue;
     const cand = ix?.parsed?.info?.mint || ix?.mint;
     if (!cand) continue;
-    // STRICT: a burn-ölt mintnek Raydium accountokban kell szerepelnie
-    if (!rayAccounts.has(cand)) { dbg("skip: burn mint not in Raydium accounts", cand); continue; }
+
+    // RELAXED: nem követeljük meg, hogy a mint szerepeljen a rayAccounts-ban,
+    // mert sok Burn külön accountból megy. A remove-liq-et úgyis kiszűri a log + vault-outflow.
     lpMint = cand;
     burnAmountRaw = Number(ix?.parsed?.info?.amount || ix?.amount || 0);
     break;
   }
-  if (!lpMint){ dbg("no LP mint match (strict)"); return; }
+  if (!lpMint){ dbg("no LP mint match (relaxed)"); return; }
   dbg("LP mint:", lpMint, "burnAmountRaw:", burnAmountRaw);
 
   // --- LP supply + burn% ---
@@ -506,17 +450,6 @@ async function processSignature(sig){
   const { baseMint, quoteMint, source } = res;
   dbg("mint resolution:", { baseMint, quoteMint, source });
 
-  // --- Vault outflow check a base/quote mintsre ---
-  if (baseMint || quoteMint){
-    const outMap = outflowByMint(tx, rayAccounts);
-    const baseOut = baseMint ? (outMap.get(baseMint) || 0) : 0;
-    const quoteOut = quoteMint ? (outMap.get(quoteMint) || 0) : 0;
-    if (baseOut > MAX_VAULT_OUTFLOW || quoteOut > MAX_VAULT_OUTFLOW){
-      dbg(`skip: vault outflow detected base=${baseOut} quote=${quoteOut}`);
-      return;
-    }
-  }
-
   // Dexscreener a base minthez (név/ár/mcap/liq + url + createdAt)
   let dx=null; if (baseMint) dx = await fetchDexscreenerByToken(baseMint);
 
@@ -547,7 +480,7 @@ async function processSignature(sig){
     if (md){ metaMutable = md.isMutable; }
   }
 
-  // --- Üzenet (Token Mint + adatok) ---
+  // --- Üzenet (csak Token Mint) ---
   const link = `https://solscan.io/tx/${sig}`;
   const burnPct = (burnShare*100).toFixed(2);
   const burnAgo = tx?.blockTime ? ago(tx.blockTime*1000) : "n/a";
@@ -605,8 +538,6 @@ function connectWS(){
       const sig = res?.value?.signature;
       const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
       if (!sig || logsArr.length===0) return;
-      // kiszűrjük a remove-liq jellegű txeket már WS-en
-      if (hasRemoveLogs(logsArr)) return;
       const hasBurnLog = logsArr.some(l => typeof l==="string" && /Instruction:\s*Burn/i.test(l));
       if (!hasBurnLog) return;
       await enqueueSignature(sig);
