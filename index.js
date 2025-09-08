@@ -71,7 +71,8 @@ class RaydiumLPBurnMonitor {
     constructor() {
         this.connection = new Connection(config.RPC_HTTP, {
             commitment: 'confirmed',
-            wsEndpoint: config.RPC_WSS
+            wsEndpoint: config.RPC_WSS,
+            confirmTransactionInitialTimeout: 60000
         });
         
         this.subscriptions = [];
@@ -80,6 +81,8 @@ class RaydiumLPBurnMonitor {
         this.tokenCache = new Map();
         this.startTime = Date.now();
         this.burnCount = 0;
+        this.retryCount = 0;
+        this.isRunning = false;
         
         logger.info('LP Burn Monitor initialized');
         logger.info(`RPC HTTP: ${config.RPC_HTTP}`);
@@ -90,32 +93,49 @@ class RaydiumLPBurnMonitor {
      * Start monitoring
      */
     async start() {
+        // Prevent multiple starts
+        if (this.isRunning) {
+            logger.warn('Monitor already running, skipping start');
+            return;
+        }
+        
+        this.isRunning = true;
         logger.info('🚀 Starting Raydium LP Burn Monitor...');
         
         try {
-            // Test connection
-            const version = await this.connection.getVersion();
+            // Test connection with timeout
+            const versionPromise = this.connection.getVersion();
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Connection timeout')), 10000)
+            );
+            
+            const version = await Promise.race([versionPromise, timeoutPromise]);
             logger.info(`Connected to Solana - Version: ${version['solana-core']}`);
             
             // Subscribe to various monitoring methods
             await this.subscribeToRaydiumPrograms();
             await this.subscribeToTokenPrograms();
             
-            // Send startup notification
-            await this.sendTelegramMessage(
-                '🚀 *LP Burn Monitor Started*\n' +
-                `⚙️ Min LP Burn: ${(config.MIN_LP_BURN_PCT * 100).toFixed(0)}%\n` +
-                `⏱️ Min Token Age: ${config.MIN_BURN_MINT_AGE_MIN} min\n` +
-                `💰 Min SOL Burn: ${config.MIN_SOL_BURN} SOL\n` +
-                `🔄 Rate: ${config.RATE_MS}ms`
-            );
+            // Send startup notification (only once)
+            if (this.burnCount === 0) {
+                await this.sendTelegramMessage(
+                    '🚀 *LP Burn Monitor Started*\n' +
+                    `⚙️ Min LP Burn: ${(config.MIN_LP_BURN_PCT * 100).toFixed(0)}%\n` +
+                    `⏱️ Min Token Age: ${config.MIN_BURN_MINT_AGE_MIN} min\n` +
+                    `💰 Min SOL Burn: ${config.MIN_SOL_BURN} SOL\n` +
+                    `🔄 Rate: ${config.RATE_MS}ms`
+                );
+            }
             
             logger.info('✅ All monitoring subscriptions active');
             
-            // Periodic stats
-            setInterval(() => this.logStats(), 60000);
+            // Periodic stats (only if not already set)
+            if (!this.statsInterval) {
+                this.statsInterval = setInterval(() => this.logStats(), 60000);
+            }
             
         } catch (error) {
+            this.isRunning = false;
             logger.error(`Failed to start monitor: ${error.message}`);
             throw error;
         }
@@ -249,17 +269,43 @@ class RaydiumLPBurnMonitor {
      */
     async analyzeTransaction(signature, slot) {
         try {
-            // Mark as processed
+            // Check if already processed
+            if (this.detectedBurns.has(signature)) {
+                return;
+            }
+            
+            // Mark as processing
             this.detectedBurns.set(signature, true);
             
-            // Rate limiting
-            await this.sleep(config.RATE_MS);
+            // Add exponential backoff for rate limiting
+            const retryDelay = Math.min(config.RATE_MS * Math.pow(2, this.retryCount || 0), 60000);
+            await this.sleep(retryDelay);
             
-            // Fetch transaction
-            const tx = await this.connection.getTransaction(signature, {
-                maxSupportedTransactionVersion: 0,
-                commitment: 'confirmed'
-            });
+            // Fetch transaction with retry logic
+            let tx = null;
+            let retries = 3;
+            
+            while (retries > 0 && !tx) {
+                try {
+                    tx = await this.connection.getTransaction(signature, {
+                        maxSupportedTransactionVersion: 0,
+                        commitment: 'confirmed'
+                    });
+                    
+                    // Reset retry count on success
+                    this.retryCount = 0;
+                    
+                } catch (error) {
+                    if (error.message?.includes('429') || error.message?.includes('Too Many Requests')) {
+                        logger.warn(`Rate limited, waiting ${retryDelay}ms before retry...`);
+                        this.retryCount = (this.retryCount || 0) + 1;
+                        await this.sleep(retryDelay * 2);
+                        retries--;
+                    } else {
+                        throw error;
+                    }
+                }
+            }
             
             if (!tx || !tx.meta) {
                 logger.debug(`No transaction data for: ${signature}`);
@@ -276,6 +322,8 @@ class RaydiumLPBurnMonitor {
             
         } catch (error) {
             logger.error(`Error analyzing tx ${signature}: ${error.message}`);
+            // Remove from processed to retry later
+            this.detectedBurns.delete(signature);
         }
     }
 
@@ -383,29 +431,26 @@ class RaydiumLPBurnMonitor {
             // LP tokens usually have specific naming patterns or are created by Raydium
             
             // Method 1: Check if the transaction involves pool operations
-            const hasPoolOps = tx.meta.logMessages?.some(log => 
-                log.includes('pool') || 
-                log.includes('liquidity') ||
-                log.includes('LP') ||
-                log.includes('Raydium')
-            );
-            
-            if (hasPoolOps) return true;
-            
-            // Method 2: Check token mint authority
-            // Raydium LP tokens often have specific authorities
-            const mintInfo = await this.connection.getParsedAccountInfo(new PublicKey(mintAddress));
-            if (mintInfo?.value?.data?.parsed?.info?.mintAuthority) {
-                const authority = mintInfo.value.data.parsed.info.mintAuthority;
-                if (authority === RAYDIUM_AUTHORITY_V4.toBase58()) {
-                    return true;
-                }
+            if (tx?.meta?.logMessages) {
+                const hasPoolOps = tx.meta.logMessages.some(log => 
+                    log && (
+                        log.includes('pool') || 
+                        log.includes('liquidity') ||
+                        log.includes('LP') ||
+                        log.includes('Raydium')
+                    )
+                );
+                
+                if (hasPoolOps) return true;
             }
             
-            // Method 3: Check if this mint is in our LP token cache
+            // Method 2: Check if this mint is in our LP token cache
             if (this.tokenCache.has(mintAddress)) {
                 return this.tokenCache.get(mintAddress).isLP;
             }
+            
+            // Skip expensive RPC call to avoid rate limits
+            // We'll rely on transaction context instead
             
             return false;
         } catch (error) {
@@ -583,8 +628,21 @@ class RaydiumLPBurnMonitor {
      * Stop monitoring
      */
     async stop() {
-        logger.info('Stopping monitor...');
+        if (!this.isRunning) {
+            logger.info('Monitor not running');
+            return;
+        }
         
+        logger.info('Stopping monitor...');
+        this.isRunning = false;
+        
+        // Clear interval
+        if (this.statsInterval) {
+            clearInterval(this.statsInterval);
+            this.statsInterval = null;
+        }
+        
+        // Remove subscriptions
         for (const subId of this.subscriptions) {
             try {
                 await this.connection.removeOnLogsListener(subId);
@@ -592,6 +650,8 @@ class RaydiumLPBurnMonitor {
                 // Ignore
             }
         }
+        
+        this.subscriptions = [];
         
         await this.sendTelegramMessage(
             `🛑 *LP Burn Monitor Stopped*\n` +
@@ -656,9 +716,26 @@ async function main() {
             process.exit(0);
         });
         
+        // Handle uncaught errors to prevent crashes
+        process.on('uncaughtException', (error) => {
+            logger.error(`Uncaught Exception: ${error.message}`);
+            logger.error(error.stack);
+            // Don't exit, try to recover
+        });
+        
+        process.on('unhandledRejection', (reason, promise) => {
+            logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+            // Don't exit, try to recover
+        });
+        
     } catch (error) {
         logger.error(`Fatal error: ${error.message}`);
-        process.exit(1);
+        
+        // Try to restart after delay
+        setTimeout(() => {
+            logger.info('Attempting to restart after error...');
+            main();
+        }, 30000); // Wait 30 seconds before restart
     }
 }
 
