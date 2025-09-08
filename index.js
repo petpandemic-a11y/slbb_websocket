@@ -25,6 +25,8 @@ if (!HELIUS_KEY || !TG_TOKEN || !TG_CHAT_ID) {
 
 // ── CONST / UTILS ─────────────────────────────────────────────────────────────
 const INCINERATOR = new PublicKey("1nc1nerator11111111111111111111111111111111");
+const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function nfmt(n) { const x = Number(n); return Number.isFinite(x) ? x.toLocaleString("en-US") : String(n ?? "?"); }
 function iso(tsSec) { return tsSec ? new Date(tsSec * 1000).toISOString() : ""; }
@@ -200,11 +202,18 @@ function startWs() {
       backoffMs = 1000;
       lastMsgTs = Date.now();
 
+      // FONTOS: SPL Token programra szűkítjük, hogy biztosan jöjjön adat
       const sub = {
         jsonrpc: "2.0",
         id: 1,
         method: "transactionSubscribe",
-        params: [{ commitment: "confirmed" }, { encoding: "jsonParsed" }]
+        params: [
+          {
+            commitment: "confirmed",
+            accountInclude: [TOKEN_PROGRAM_ID] // minden SPL tx jön → lokálisan szűrünk
+          },
+          { encoding: "jsonParsed" }
+        ]
       };
       ws.send(JSON.stringify(sub));
 
@@ -259,7 +268,7 @@ function startWs() {
 
         // SPL Burn
         for (const i of tx.instructions || []) {
-          if (i.programId === "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" && i.parsed?.type === "burn") {
+          if (i.programId === TOKEN_PROGRAM_ID && i.parsed?.type === "burn") {
             const mint = i.parsed?.info?.mint;
             if (!mint) continue;
             if (raydiumLpSet.size && !raydiumLpSet.has(mint)) {
