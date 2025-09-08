@@ -1,34 +1,29 @@
 // index.js
-// Node 18+ (ESM). WebSocket alapú Raydium LP burn/incinerator figyelő
-// - Helius WS azonnal indul
-// - Raydium LP mint cache háttérben (timeout + retry)
-// - Incinerator ATA + SPL Burn detektálás
-// - Dexscreener adatok (név/szimbólum/MCAP/LIQ/link)
-// - Részletes DEBUG log, keepalive ping, heartbeat, exponenciális reconnect
+// Node 18+ (ESM). Raydium LP burn/incinerator watcher (Helius WS + Dexscreener + TG)
 
 import WebSocket from "ws";
 import { PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 
-// ===== ENV =====
+// ── ENV ────────────────────────────────────────────────────────────────────────
 const HELIUS_KEY = process.env.HELIUS_API_KEY;
 const TG_TOKEN   = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const DEBUG      = (process.env.DEBUG || "0") === "1";
 
-// Opcionális küszöbök (ha 0/üres, nem szűr)
+// Optional thresholds (0 = off)
 const MIN_MCAP_USD     = Number(process.env.MIN_MCAP_USD || 0);
 const MIN_LIQ_USD      = Number(process.env.MIN_LIQ_USD  || 0);
 const MIN_LP_AMOUNT    = Number(process.env.MIN_LP_AMOUNT || 0);
-const MIN_PAIR_AGE_MIN = Number(process.env.MIN_PAIR_AGE_MIN || 0); // Dex pairCreatedAt alapján
+const MIN_PAIR_AGE_MIN = Number(process.env.MIN_PAIR_AGE_MIN || 0);
 const REQUIRE_DEX_DATA = (process.env.REQUIRE_DEX_DATA || "false").toLowerCase() === "true";
 
 if (!HELIUS_KEY || !TG_TOKEN || !TG_CHAT_ID) {
-  console.error("Hiányzó env: HELIUS_API_KEY, TG_BOT_TOKEN, TG_CHAT_ID");
+  console.error("Missing env: HELIUS_API_KEY, TG_BOT_TOKEN, TG_CHAT_ID");
   process.exit(1);
 }
 
-// ===== KONSTANSOK / UTIL =====
+// ── CONST / UTILS ─────────────────────────────────────────────────────────────
 const INCINERATOR = new PublicKey("1nc1nerator11111111111111111111111111111111");
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function nfmt(n) { const x = Number(n); return Number.isFinite(x) ? x.toLocaleString("en-US") : String(n ?? "?"); }
@@ -52,7 +47,7 @@ async function fetchJsonWithTimeout(url, { timeoutMs = 10000, tries = 3, headers
   }
 }
 
-// ===== DEXSCREENER =====
+// ── Dexscreener ───────────────────────────────────────────────────────────────
 async function fetchDexscreenerData(mint) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/solana/${mint}`;
@@ -66,16 +61,15 @@ async function fetchDexscreenerData(mint) {
       mcap: Number(p.fdv ?? p.marketCap ?? 0),
       liq: Number(p.liquidity?.usd ?? 0),
       url: `https://dexscreener.com/solana/${p.pairAddress}`,
-      pairCreatedAtMs: Number(p.pairCreatedAt ?? 0),
-      raw: p
+      pairCreatedAtMs: Number(p.pairCreatedAt ?? 0)
     };
   } catch (e) {
-    if (DEBUG) console.log("Dexscreener hiba:", e.message);
+    if (DEBUG) console.log("Dexscreener error:", e.message);
     return null;
   }
 }
 
-// ===== TELEGRAM =====
+// ── Telegram ──────────────────────────────────────────────────────────────────
 async function tgSend(msg) {
   try {
     const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
@@ -85,31 +79,31 @@ async function tgSend(msg) {
       body: JSON.stringify({ chat_id: TG_CHAT_ID, text: msg, parse_mode: "HTML", disable_web_page_preview: true })
     });
   } catch (e) {
-    if (DEBUG) console.log("TG küldés hiba:", e.message);
+    if (DEBUG) console.log("Telegram send error:", e.message);
   }
 }
 
-// ===== RAYDIUM LP CACHE (HÁTTÉRBEN) =====
+// ── Raydium LP cache (background) ─────────────────────────────────────────────
 let raydiumLpSet = new Set();
 
 async function refreshRaydiumLpSet() {
   try {
-    const pools = await fetchJsonWithTimeout(
-      "https://api.raydium.io/v2/main/pairs",
-      { timeoutMs: 15000, tries: 3, headers: { accept: "application/json" } }
-    );
+    const pools = await fetchJsonWithTimeout("https://api.raydium.io/v2/main/pairs", {
+      timeoutMs: 15000,
+      tries: 3,
+      headers: { accept: "application/json" }
+    });
     const mints = (pools || []).map(p => p.lpMint).filter(Boolean);
     raydiumLpSet = new Set(mints);
-    if (DEBUG) console.log(`Raydium LP cache frissítve: ${mints.length} mint`);
+    if (DEBUG) console.log(`Raydium LP cache refreshed: ${mints.length} mints`);
   } catch (e) {
-    if (DEBUG) console.log("Raydium LP frissítés hiba:", e.message);
+    if (DEBUG) console.log("Raydium LP refresh failed:", e.message);
   }
 }
-// indulás után és 10 percenként frissít
 setTimeout(refreshRaydiumLpSet, 0);
 setInterval(refreshRaydiumLpSet, 10 * 60 * 1000);
 
-// ===== TALÁLAT KEZELŐ + SZŰRÉS =====
+// ── Hit handler + filters ─────────────────────────────────────────────────────
 async function handleHit({ type, mint, amount, sig, tsSec }) {
   const when = iso(tsSec);
   const amtNum = Number(amount || 0);
@@ -124,35 +118,34 @@ async function handleHit({ type, mint, amount, sig, tsSec }) {
   }
 
   if (MIN_LP_AMOUNT > 0 && !(Number.isFinite(amtNum) && amtNum >= MIN_LP_AMOUNT)) {
-    if (DEBUG) console.log("⛔ MIN_LP_AMOUNT szűrő miatt kiesett");
+    if (DEBUG) console.log("⛔ filtered: MIN_LP_AMOUNT");
     return;
   }
 
   const dex = await fetchDexscreenerData(mint);
-
   if (REQUIRE_DEX_DATA && !dex) {
-    if (DEBUG) console.log("⛔ REQUIRE_DEX_DATA=true, de nincs Dex adat");
+    if (DEBUG) console.log("⛔ filtered: REQUIRE_DEX_DATA but no Dex data");
     return;
   }
 
   if (dex) {
-    if (MIN_MCAP_USD > 0 && !(dex.mcap >= MIN_MCAP_USD)) {
-      if (DEBUG) console.log("⛔ MIN_MCAP_USD szűrő miatt kiesett");
+    if (MIN_MCAP_USD > 0 && dex.mcap < MIN_MCAP_USD) {
+      if (DEBUG) console.log("⛔ filtered: MIN_MCAP_USD");
       return;
     }
-    if (MIN_LIQ_USD > 0 && !(dex.liq >= MIN_LIQ_USD)) {
-      if (DEBUG) console.log("⛔ MIN_LIQ_USD szűrő miatt kiesett");
+    if (MIN_LIQ_USD > 0 && dex.liq < MIN_LIQ_USD) {
+      if (DEBUG) console.log("⛔ filtered: MIN_LIQ_USD");
       return;
     }
     if (MIN_PAIR_AGE_MIN > 0 && dex.pairCreatedAtMs > 0 && tsSec) {
       const ageMin = (tsSec * 1000 - dex.pairCreatedAtMs) / 60000;
-      if (!(ageMin >= MIN_PAIR_AGE_MIN)) {
-        if (DEBUG) console.log(`⛔ Pár túl friss: ${ageMin.toFixed(2)} min (< ${MIN_PAIR_AGE_MIN})`);
+      if (ageMin < MIN_PAIR_AGE_MIN) {
+        if (DEBUG) console.log(`⛔ filtered: pair age ${ageMin.toFixed(2)}m < ${MIN_PAIR_AGE_MIN}m`);
         return;
       }
     }
   } else if (MIN_MCAP_USD > 0 || MIN_LIQ_USD > 0 || MIN_PAIR_AGE_MIN > 0) {
-    if (DEBUG) console.log("⛔ Küszöbök aktívak, de nincs Dex adat → drop");
+    if (DEBUG) console.log("⛔ filtered: thresholds set but no Dex data");
     return;
   }
 
@@ -179,7 +172,7 @@ async function handleHit({ type, mint, amount, sig, tsSec }) {
   if (DEBUG) console.log("--- DEBUG END ---\n");
 }
 
-// ===== WEBSOCKET INDÍTÁS (KEEPALIVE + HEARTBEAT + BACKOFF) =====
+// ── WebSocket (keepalive + heartbeat + backoff) ───────────────────────────────
 function startWs() {
   const url = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
   let backoffMs = 1000;
@@ -244,13 +237,13 @@ function startWs() {
 
         const hits = [];
 
-        // 1) tokenTransfers → incinerator ATA (ATA on-the-fly)
+        // tokenTransfers → incinerator ATA
         for (const t of tx.tokenTransfers || []) {
           const { mint, toTokenAccount, tokenAmount } = t || {};
           if (!mint) continue;
 
           if (raydiumLpSet.size && !raydiumLpSet.has(mint)) {
-            if (DEBUG) console.log(`[${sig}] skip (nem Raydium LP): ${mint}`);
+            if (DEBUG) console.log(`[${sig}] skip (not Raydium LP): ${mint}`);
             continue;
           }
 
@@ -264,13 +257,13 @@ function startWs() {
           }
         }
 
-        // 2) SPL Burn
+        // SPL Burn
         for (const i of tx.instructions || []) {
           if (i.programId === "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" && i.parsed?.type === "burn") {
             const mint = i.parsed?.info?.mint;
             if (!mint) continue;
             if (raydiumLpSet.size && !raydiumLpSet.has(mint)) {
-              if (DEBUG) console.log(`[${sig}] skip burn (nem Raydium LP): ${mint}`);
+              if (DEBUG) console.log(`[${sig}] skip burn (not Raydium LP): ${mint}`);
               continue;
             }
             hits.push({ type: "BURN", mint, amount: i.parsed?.info?.amount });
@@ -304,18 +297,17 @@ function startWs() {
       console.log("WS closed, reconnecting…");
       cleanup();
       setTimeout(openWs, backoffMs);
-      backoffMs = Math.min(backoffMs * 2, 30000); // max 30s
+      backoffMs = Math.min(backoffMs * 2, 30000);
     });
 
     ws.on("error", (err) => {
       if (DEBUG) console.log("WS error:", err?.message || String(err));
-      // a close handler intézi a reconnectet
+      // close handler will reconnect
     });
   };
 
   openWs();
 }
 
-// ===== MAIN =====
+// ── MAIN ──────────────────────────────────────────────────────────────────────
 startWs();
-```0
