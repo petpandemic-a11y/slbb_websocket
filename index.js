@@ -202,7 +202,6 @@ function startWs() {
       backoffMs = 1000;
       lastMsgTs = Date.now();
 
-      // FONTOS: SPL Token programra szűkítjük, hogy biztosan jöjjön adat
       const sub = {
         jsonrpc: "2.0",
         id: 1,
@@ -249,12 +248,12 @@ function startWs() {
         // tokenTransfers → incinerator ATA
         for (const t of tx.tokenTransfers || []) {
           const { mint, toTokenAccount, tokenAmount } = t || {};
+          if (DEBUG) {
+            console.log(`[CHECK tokenTransfer] sig=${sig} mint=${mint} to=${toTokenAccount} amt=${tokenAmount}`);
+          }
           if (!mint) continue;
 
-          if (raydiumLpSet.size && !raydiumLpSet.has(mint)) {
-            if (DEBUG) console.log(`[${sig}] skip (not Raydium LP): ${mint}`);
-            continue;
-          }
+          if (raydiumLpSet.size && !raydiumLpSet.has(mint)) continue;
 
           let incAta;
           try {
@@ -268,13 +267,13 @@ function startWs() {
 
         // SPL Burn
         for (const i of tx.instructions || []) {
+          if (DEBUG) {
+            console.log(`[CHECK instr] sig=${sig} prog=${i.programId} type=${i.parsed?.type} mint=${i.parsed?.info?.mint}`);
+          }
           if (i.programId === TOKEN_PROGRAM_ID && i.parsed?.type === "burn") {
             const mint = i.parsed?.info?.mint;
             if (!mint) continue;
-            if (raydiumLpSet.size && !raydiumLpSet.has(mint)) {
-              if (DEBUG) console.log(`[${sig}] skip burn (not Raydium LP): ${mint}`);
-              continue;
-            }
+            if (raydiumLpSet.size && !raydiumLpSet.has(mint)) continue;
             hits.push({ type: "BURN", mint, amount: i.parsed?.info?.amount });
           }
         }
@@ -311,7 +310,6 @@ function startWs() {
 
     ws.on("error", (err) => {
       if (DEBUG) console.log("WS error:", err?.message || String(err));
-      // close handler will reconnect
     });
   };
 
