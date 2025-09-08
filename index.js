@@ -192,13 +192,22 @@ class RaydiumLPBurnMonitor {
         
         const logMessages = logs.logs || [];
         
+        // Only process if Raydium is involved
+        const hasRaydium = logMessages.some(msg => 
+            msg.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8') ||
+            msg.includes('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK') ||
+            msg.includes('CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C')
+        );
+        
+        if (!hasRaydium) return;
+        
         // Check for burn instructions or transfers to burn addresses
         for (const message of logMessages) {
             if (message.includes('Instruction: Burn') ||
                 message.includes('Instruction: BurnChecked') ||
                 this.containsBurnAddress(message)) {
                 
-                logger.debug(`Token burn detected in tx: ${signature}`);
+                logger.debug(`LP Token burn detected in tx: ${signature}`);
                 await this.analyzeTransaction(signature, context.slot);
                 break;
             }
@@ -287,8 +296,16 @@ class RaydiumLPBurnMonitor {
             burner: null,
             poolId: null,
             timestamp: tx.blockTime,
-            solValue: 0
+            solValue: 0,
+            isLPToken: false
         };
+        
+        // Check if this involves Raydium
+        const hasRaydiumProgram = transaction.message.accountKeys.some(key => 
+            key.toBase58() === '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8' ||
+            key.toBase58() === 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK' ||
+            key.toBase58() === 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C'
+        );
         
         // Find LP token burns
         for (let i = 0; i < meta.preTokenBalances.length; i++) {
@@ -303,16 +320,21 @@ class RaydiumLPBurnMonitor {
             const postAmount = BigInt(post.uiTokenAmount.amount || 0);
             
             // Check if this is a burn (transfer to burn address)
-            if (BURN_ADDRESSES.includes(pre.owner) && postAmount > preAmount) {
+            if (BURN_ADDRESSES.includes(post.owner) && postAmount > preAmount) {
                 // Tokens received at burn address
                 const burnAmount = postAmount - preAmount;
                 
                 burnInfo.tokenMint = pre.mint;
                 burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals);
                 
+                // Check if this is an LP token
+                burnInfo.isLPToken = await this.isLPToken(pre.mint, tx);
+                
                 // Find the sender
                 const sender = meta.preTokenBalances.find(b => 
-                    b.mint === pre.mint && !BURN_ADDRESSES.includes(b.owner)
+                    b.mint === pre.mint && 
+                    !BURN_ADDRESSES.includes(b.owner) &&
+                    BigInt(b.uiTokenAmount.amount) >= burnAmount
                 );
                 
                 if (sender) {
@@ -325,6 +347,22 @@ class RaydiumLPBurnMonitor {
                     }
                 }
             }
+            
+            // Alternative: Check for direct burns (amount decrease to 0)
+            if (preAmount > 0n && postAmount === 0n && !BURN_ADDRESSES.includes(pre.owner)) {
+                const burnAmount = preAmount;
+                
+                burnInfo.tokenMint = pre.mint;
+                burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals);
+                burnInfo.burner = pre.owner;
+                burnInfo.burnPercentage = 1.0; // 100% burn
+                burnInfo.isLPToken = await this.isLPToken(pre.mint, tx);
+            }
+        }
+        
+        // Only return if it's an LP token or involves Raydium
+        if (!burnInfo.isLPToken && !hasRaydiumProgram) {
+            return null;
         }
         
         // Try to identify pool
@@ -334,6 +372,46 @@ class RaydiumLPBurnMonitor {
         burnInfo.solValue = await this.estimateSolValue(burnInfo);
         
         return burnInfo.tokenMint ? burnInfo : null;
+    }
+    
+    /**
+     * Check if token is an LP token
+     */
+    async isLPToken(mintAddress, tx) {
+        try {
+            // Check if mint is associated with a Raydium pool
+            // LP tokens usually have specific naming patterns or are created by Raydium
+            
+            // Method 1: Check if the transaction involves pool operations
+            const hasPoolOps = tx.meta.logMessages?.some(log => 
+                log.includes('pool') || 
+                log.includes('liquidity') ||
+                log.includes('LP') ||
+                log.includes('Raydium')
+            );
+            
+            if (hasPoolOps) return true;
+            
+            // Method 2: Check token mint authority
+            // Raydium LP tokens often have specific authorities
+            const mintInfo = await this.connection.getParsedAccountInfo(new PublicKey(mintAddress));
+            if (mintInfo?.value?.data?.parsed?.info?.mintAuthority) {
+                const authority = mintInfo.value.data.parsed.info.mintAuthority;
+                if (authority === RAYDIUM_AUTHORITY_V4.toBase58()) {
+                    return true;
+                }
+            }
+            
+            // Method 3: Check if this mint is in our LP token cache
+            if (this.tokenCache.has(mintAddress)) {
+                return this.tokenCache.get(mintAddress).isLP;
+            }
+            
+            return false;
+        } catch (error) {
+            logger.debug(`Error checking LP token status: ${error.message}`);
+            return false;
+        }
     }
 
     /**
@@ -374,9 +452,15 @@ class RaydiumLPBurnMonitor {
      * Validate burn against criteria
      */
     validateBurn(burnInfo) {
+        // Only validate LP tokens
+        if (!burnInfo.isLPToken) {
+            logger.debug(`Not an LP token burn: ${burnInfo.tokenMint}`);
+            return false;
+        }
+        
         // Check burn percentage
         if (burnInfo.burnPercentage < config.MIN_LP_BURN_PCT) {
-            logger.debug(`Burn percentage too low: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
+            logger.debug(`LP burn percentage too low: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
             return false;
         }
         
