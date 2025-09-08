@@ -1,5 +1,5 @@
 // Raydium LP burn watcher → Telegram
-// (remove-liq skip + same-tx MintTo filter + min mint age + vault-outflow check + base/quote resolve + token+LP created time)
+// (remove-liq skip + same-tx MintTo filter + min burn-mint age + address-table aware outflow + base/quote resolve + token+LP created time)
 
 import WebSocket from "ws";
 import http from "http";
@@ -16,7 +16,10 @@ const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);          // becsült
 const MIN_LP_BURN_PCT = Number(process.env.MIN_LP_BURN_PCT || 0.99); // 0.99 = 99%+
 const MAX_TOKEN_AGE_MIN = Number(process.env.MAX_TOKEN_AGE_MIN || 60); // LP pair kor (Dexscreener pairCreatedAt) limit
 const MAX_VAULT_OUTFLOW = Number(process.env.MAX_VAULT_OUTFLOW || 0.001); // token egység (mintenként)
-const MIN_BURN_MINT_AGE_MIN = Number(process.env.MIN_BURN_MINT_AGE_MIN || 15); // 🔒 a BURNÖLT MINT minimum kora
+const MIN_BURN_MINT_AGE_MIN = Number(process.env.MIN_BURN_MINT_AGE_MIN || 15); // a BURNÖLT MINT minimum kora (perc)
+const MINT_HISTORY_PAGES = Number(process.env.MINT_HISTORY_PAGES || 100);      // token creation lapozás: oldalak
+const MINT_HISTORY_PAGE_LIMIT = Number(process.env.MINT_HISTORY_PAGE_LIMIT || 1000); // token creation: elemszám/oldal
+
 const DEBUG = process.env.DEBUG === "1";
 const RATE_MS = Number(process.env.RATE_MS || 1000);
 
@@ -27,6 +30,7 @@ const TOKENKEG   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const WSOL_MINT  = "So11111111111111111111111111111111111111112";
 const METAPLEX_META = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 
+// Gyakori quote mint-ek
 const QUOTE_MINTS = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
@@ -88,10 +92,10 @@ async function tokenAccountInfo(pubkey){
 async function fetchDexscreenerByToken(mint){
   try{
     const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { headers:{accept:"application/json"} });
-    if (!r.ok) return null;
+    if (!r.ok) { dbg("dexs HTTP", r.status); return null; }
     const j = await r.json();
     const pairs = Array.isArray(j?.pairs) ? j.pairs : [];
-    if (!pairs.length) return null;
+    if (!pairs.length) { dbg("dexs pairs=0"); return null; }
     pairs.sort((a,b)=>{
       const ra = (a?.dexId||"").toLowerCase()==="raydium" ? 0 : 1;
       const rb = (b?.dexId||"").toLowerCase()==="raydium" ? 0 : 1;
@@ -109,7 +113,7 @@ async function fetchDexscreenerByToken(mint){
       url:    p?.url || null,
       createdAt: p?.pairCreatedAt || null
     };
-  }catch{ return null; }
+  }catch(e){ dbg("dexs err:", e.message); return null; }
 }
 
 // ===== Metaplex metadata (név/szimbólum/mutable) =====
@@ -178,7 +182,7 @@ function saveSent() {
   try {
     const entries = [...sentMap.entries()];
     entries.sort((a,b)=>a[1]-b[1]);
-    const trimmed = entries.slice(Math.max(0, entries.length - SENT_MAX));
+    const trimmed = entries slice(Math.max(0, entries.length - SENT_MAX));
     fs.writeFileSync(SENT_FILE, JSON.stringify(trimmed), "utf8");
   } catch {}
 }
@@ -348,16 +352,25 @@ async function resolveMintsFallback(rayAccounts, lpMint){
   return { baseMint:null, quoteMint:null, source:"freq-none" };
 }
 
-// ===== Vault outflow aggregáció =====
+// ===== v0 address table aware accountKey feloldás =====
+function keyToStr(k){ return typeof k==="string" ? k : (k?.pubkey || k?.toString?.()); }
+function buildAllAccountKeys(tx){
+  const stat = tx?.transaction?.message?.accountKeys || [];
+  const loaded = tx?.meta?.loadedAddresses || { writable: [], readonly: [] };
+  const statS = stat.map(keyToStr);
+  const wrS   = (loaded.writable || []).map(keyToStr);
+  const rdS   = (loaded.readonly || []).map(keyToStr);
+  return [...statS, ...wrS, ...rdS];
+}
+
+// ===== Vault outflow aggregáció (v0-kompatibilis) =====
 function outflowByMint(tx, rayAccountsSet) {
-  const pre = tx?.meta?.preTokenBalances || [];
+  const pre  = tx?.meta?.preTokenBalances  || [];
   const post = tx?.meta?.postTokenBalances || [];
-  const keys = tx?.transaction?.message?.accountKeys || [];
-  const idxToPk = i => {
-    const k = keys[i];
-    return typeof k === "string" ? k : (k?.pubkey || k?.toString?.());
-  };
-  const map = new Map();
+  const allKeys = buildAllAccountKeys(tx);
+  const idxToPk = i => allKeys[i];
+
+  const map = new Map(); // pk -> rec
   for (const b of pre) {
     const pk = idxToPk(b?.accountIndex);
     if (!pk) continue;
@@ -372,41 +385,50 @@ function outflowByMint(tx, rayAccountsSet) {
     const pk = idxToPk(b?.accountIndex);
     if (!pk) continue;
     const rec = map.get(pk) || {
-      pre: 0, post: 0,
-      mint: b?.mint,
+      pre: 0, post: 0, mint: b?.mint,
       dec: Number(b?.uiTokenAmount?.decimals || 0)
     };
     rec.post = Number(b?.uiTokenAmount?.amount || 0);
     map.set(pk, rec);
   }
-  const byMint = new Map();
+
+  const byMint = new Map(); // mint -> outflowAbs (token egység)
   for (const [pk, rec] of map.entries()) {
-    if (!rayAccountsSet.has(pk)) continue;
-    const rawDiff = rec.post - rec.pre; // negatív: outflow
-    if (rawDiff < 0) {
-      const absUnits = (-rawDiff) / Math.pow(10, rec.dec || 0);
+    if (!rayAccountsSet.has(pk)) continue;      // csak Raydiumhoz kötődő számlák
+    const diff = rec.post - rec.pre;            // negatív: kiáramlás
+    if (diff < 0) {
+      const absUnits = (-diff) / Math.pow(10, rec.dec || 0);
       byMint.set(rec.mint, (byMint.get(rec.mint) || 0) + absUnits);
     }
   }
   return byMint;
 }
 
-// ===== Token creation time helpers =====
-async function getTokenCreationTimeMs(mint, maxPages=5, pageLimit=1000){
+// ===== Token creation time (earliest signature blockTime) – deep pagination + cache =====
+const tokenCreatedCache = new Map(); // mint -> ms
+async function getTokenCreationTimeMs(mint){
+  if (tokenCreatedCache.has(mint)) return tokenCreatedCache.get(mint);
   try{
     let before = undefined;
-    let oldest = null;
-    for (let i=0;i<maxPages;i++){
-      const params = before ? [mint, { limit: pageLimit, before }] : [mint, { limit: pageLimit }];
+    let oldestSeen = null;
+    for (let i=0;i<MINT_HISTORY_PAGES;i++){
+      const params = before ? [mint, { limit: MINT_HISTORY_PAGE_LIMIT, before }] : [mint, { limit: MINT_HISTORY_PAGE_LIMIT }];
       const sigs = await rpc("getSignaturesForAddress", params);
       if (!Array.isArray(sigs) || sigs.length === 0) break;
-      oldest = sigs[sigs.length - 1];
-      if (sigs.length < pageLimit) break;
-      before = oldest.signature;
+      oldestSeen = sigs[sigs.length - 1];
+      if (before === oldestSeen.signature) break;
+      before = oldestSeen.signature;
+      if (sigs.length < MINT_HISTORY_PAGE_LIMIT) break;
     }
-    const bt = oldest?.blockTime;
-    return (typeof bt === "number" && bt>0) ? bt*1000 : null;
-  }catch(e){ dbg("getTokenCreationTimeMs err:", e.message); return null; }
+    const bt = oldestSeen?.blockTime;
+    const ms = (typeof bt === "number" && bt>0) ? bt*1000 : null;
+    tokenCreatedCache.set(mint, ms);
+    return ms;
+  }catch(e){
+    dbg("getTokenCreationTimeMs err:", e.message);
+    tokenCreatedCache.set(mint, null);
+    return null;
+  }
 }
 
 // ===== Main =====
@@ -438,14 +460,13 @@ async function processSignature(sig){
 
   // Burn keresés (RELAXED) + same-tx MintTo filter
   let lpMint=null, burnAmountRaw=0;
-  let mintedThisTx = new Set();
+  const mintedThisTx = new Set();
   for (const ix of all){
     const pid = typeof ix?.programId==="string" ? ix.programId : null;
     if (pid!==TOKENKEG) continue;
     const t = (ix?.parsed?.type || ix?.instructionName || "").toLowerCase();
     const mintAddr = ix?.parsed?.info?.mint || ix?.mint;
-    if (!mintAddr) continue;
-    if (t.includes("mintto")) mintedThisTx.add(mintAddr); // MintTo vagy MintToChecked
+    if (mintAddr && t.includes("mintto")) mintedThisTx.add(mintAddr); // MintTo / MintToChecked
   }
   for (const ix of all){
     const pid = typeof ix?.programId==="string" ? ix.programId : null;
@@ -454,11 +475,7 @@ async function processSignature(sig){
     if (!isBurn) continue;
     const cand = ix?.parsed?.info?.mint || ix?.mint;
     if (!cand) continue;
-
-    if (mintedThisTx.has(cand)) { // 🔒 router/receipt mint → dobjuk
-      dbg("skip: same-tx MintTo for burned mint", cand);
-      continue;
-    }
+    if (mintedThisTx.has(cand)) { dbg("skip: same-tx MintTo for burned mint", cand); continue; }
     lpMint = cand;
     burnAmountRaw = Number(ix?.parsed?.info?.amount || ix?.amount || 0);
     break;
@@ -466,7 +483,7 @@ async function processSignature(sig){
   if (!lpMint){ dbg("no LP mint match (relaxed)"); return; }
   dbg("LP mint:", lpMint, "burnAmountRaw:", burnAmountRaw);
 
-  // Burn mint kor szűrő (router-share mintek ellen)
+  // Burn mint kor szűrő
   if (MIN_BURN_MINT_AGE_MIN > 0){
     const burnMintCreatedMs = await getTokenCreationTimeMs(lpMint);
     if (!burnMintCreatedMs){
@@ -520,13 +537,13 @@ async function processSignature(sig){
   const { baseMint, quoteMint, source } = res;
   dbg("mint resolution:", { baseMint, quoteMint, source });
 
-  // 🔒 Biztonsági drop: ha nincs base/quote és 100%-os a burn → valószínű router-belső burn
+  // Biztonsági drop: ha nincs base/quote és 100%-os a burn → valószínű router-belső burn
   if (!baseMint && burnShare >= 0.999){
     dbg("skip: no base/quote resolved AND burnShare ~100%");
     return;
   }
 
-  // Vault outflow check a base/quote mintekre
+  // Vault outflow check a base/quote mintekre (v0 address table aware)
   if (baseMint || quoteMint){
     const outMap = outflowByMint(tx, rayAccounts);
     const baseOut = baseMint ? (outMap.get(baseMint) || 0) : 0;
@@ -552,9 +569,14 @@ async function processSignature(sig){
     }
   }
 
-  // Token creation time (base mint) – kijelzéshez
+  // Token creation time (base mint) – kijelzéshez + szaniter
   let tokenCreatedMs = null;
   if (baseMint) tokenCreatedMs = await getTokenCreationTimeMs(baseMint);
+  const lpCreatedMs = dx?.createdAt ? Number(dx.createdAt) : null;
+  if (tokenCreatedMs && lpCreatedMs && tokenCreatedMs > lpCreatedMs) {
+    dbg(`sanity: tokenCreated(${new Date(tokenCreatedMs).toISOString()}) > lpCreated(${new Date(lpCreatedMs).toISOString()}) → drop tokenCreated`);
+    tokenCreatedMs = null;
+  }
 
   // Meta + security a base tokenhez
   let mintAuthNone=null, freezeNone=null, metaMutable=null;
@@ -578,8 +600,6 @@ async function processSignature(sig){
   const liqStr  = dx?.liq!=null  ? `$${dx.liq.toLocaleString()}` : "n/a";
   const priceStr= dx?.price!=null? `$${dx.price}` : "n/a";
   const tokenMintLine = baseMint ? `🧾 <b>Token Mint:</b> <code>${baseMint}</code>` : `🧾 <b>Token Mint:</b> n/a`;
-
-  // Token + LP creation sorok
   const tokenCreatedLine = `📅 <b>Token Created:</b> ${fmt(tokenCreatedMs)}${tokenCreatedMs?` (${ago(tokenCreatedMs)})`:""}`;
   const lpCreatedLine = dx?.createdAt ? `🏊 <b>LP Created:</b> ${fmt(Number(dx.createdAt))} (${ago(Number(dx.createdAt))})` : null;
 
