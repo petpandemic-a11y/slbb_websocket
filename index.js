@@ -1,8 +1,9 @@
 // index.js
 // Node 18+ (ESM). Raydium LP burn/incinerator watcher
-// Kettős feliratkozás: logsSubscribe(Token program) + transactionSubscribe(ALL)
-// + Keepalive, heartbeat, backoff, Raydium LP cache (background),
-//   incinerator + SPL Burn detektálás, Dexscreener, rövid DEBUG logok.
+// Feliratkozás: logsSubscribe(Token) + transactionSubscribe(ALL)
+// + keepalive, heartbeat, backoff, Raydium LP cache (bg),
+//   incinerator + SPL Burn detektálás, Dexscreener, rövid DEBUG logok,
+//   feliratkozás OK log, 15s után automatikus "widen", opcionális Raydium-szűrő kikapcs.
 
 import WebSocket from "ws";
 import { PublicKey } from "@solana/web3.js";
@@ -13,6 +14,7 @@ const HELIUS_KEY = process.env.HELIUS_API_KEY;
 const TG_TOKEN   = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const DEBUG      = (process.env.DEBUG || "0") === "1";
+const DISABLE_RAYDIUM_FILTER = (process.env.DISABLE_RAYDIUM_FILTER || "0") === "1";
 
 // Optional thresholds (0 = off)
 const MIN_MCAP_USD     = Number(process.env.MIN_MCAP_USD || 0);
@@ -94,9 +96,7 @@ let raydiumLpSet = new Set();
 async function refreshRaydiumLpSet() {
   try {
     const pools = await fetchJsonWithTimeout("https://api.raydium.io/v2/main/pairs", {
-      timeoutMs: 15000,
-      tries: 3,
-      headers: { accept: "application/json" }
+      timeoutMs: 15000, tries: 3, headers: { accept: "application/json" }
     });
     const mints = (pools || []).map(p => p.lpMint).filter(Boolean);
     raydiumLpSet = new Set(mints);
@@ -193,7 +193,8 @@ function startWs() {
       HELIUS_API_KEY: HELIUS_KEY ? `len=${HELIUS_KEY.length}` : "MISSING",
       TG_BOT_TOKEN: !!TG_TOKEN,
       TG_CHAT_ID: TG_CHAT_ID,
-      DEBUG
+      DEBUG,
+      DISABLE_RAYDIUM_FILTER
     });
   }
 
@@ -205,14 +206,14 @@ function startWs() {
       backoffMs = 1000;
       lastMsgTs = Date.now();
 
-      // 1) Token program logs (mindig jön valami)
+      // 1) Token program logs
       ws.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
         method: "logsSubscribe",
         params: [{ mentions: [TOKEN_PROGRAM_ID], commitment: "confirmed" }, { encoding: "jsonParsed" }]
       }));
-      // 2) Minden tranzakció (ALL) – lokálisan szűrünk
+      // 2) Minden tranzakció (ALL)
       ws.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 2,
@@ -220,6 +221,20 @@ function startWs() {
         params: [{ commitment: "confirmed" }, { encoding: "jsonParsed" }]
       }));
       console.log("[SUB] logsSubscribe(Token) + transactionSubscribe(ALL)");
+
+      // 15s után, ha nincs üzenet → widen logs (mentions nélkül)
+      setTimeout(() => {
+        const idleSec = Math.floor((Date.now() - lastMsgTs) / 1000);
+        if (idleSec >= 15) {
+          console.log("[WIDEN] No messages for 15s → logsSubscribe without filter");
+          ws.send(JSON.stringify({
+            jsonrpc: "2.0",
+            id: 3,
+            method: "logsSubscribe",
+            params: [{ commitment: "confirmed" }, { encoding: "jsonParsed" }]
+          }));
+        }
+      }, 15000);
 
       // keepalive ping 20s
       pingTimer = setInterval(() => { try { ws.ping(); } catch {} }, 20000);
@@ -241,13 +256,25 @@ function startWs() {
       try {
         const data = JSON.parse(raw.toString());
 
-        // A) LOGS stream rövid jelzés (hogy "mit néz")
+        // Feliratkozás visszaigazolások
+        if (data.id === 1 && data.result) { console.log(`[SUB OK] logsSubscribe id=${data.result}`); return; }
+        if (data.id === 2 && data.result) { console.log(`[SUB OK] transactionSubscribe id=${data.result}`); return; }
+        if (data.id === 3 && data.result) { console.log(`[SUB OK] logsSubscribe (widen) id=${data.result}`); return; }
+
+        // Rövid “mit kaptunk” log
+        if (DEBUG && data.method && data.params) {
+          const m = data.method;
+          const sig =
+            data.params?.result?.value?.signature ||  // logsNotification
+            data.params?.result?.signature ||         // transactionNotification
+            "";
+          console.log(`[RX] ${m}${sig ? ` sig=${sig}` : ""}`);
+        }
+
+        // A) LOGS stream: csak jelzés
         if (data.method === "logsNotification") {
           lastMsgTs = Date.now();
-          const logs = data.params?.result?.value?.logs || [];
-          const sig  = data.params?.result?.value?.signature || "";
-          if (DEBUG) console.log(`[CHECK logs] sig=${sig} lines=${logs.length}`);
-          return; // csak jelzés; hit-ek a transactionNotification ágon
+          return;
         }
 
         // B) TRANSACTION stream – itt dolgozunk
@@ -266,7 +293,7 @@ function startWs() {
           if (DEBUG) console.log(`[CHECK tokenTransfer] sig=${sig} mint=${mint} to=${toTokenAccount} amt=${tokenAmount}`);
           if (!mint) continue;
 
-          if (raydiumLpSet.size && !raydiumLpSet.has(mint)) continue;
+          if (!DISABLE_RAYDIUM_FILTER && raydiumLpSet.size && !raydiumLpSet.has(mint)) continue;
 
           let incAta;
           try {
@@ -284,7 +311,7 @@ function startWs() {
           if (i.programId === TOKEN_PROGRAM_ID && i.parsed?.type === "burn") {
             const mint = i.parsed?.info?.mint;
             if (!mint) continue;
-            if (raydiumLpSet.size && !raydiumLpSet.has(mint)) continue;
+            if (!DISABLE_RAYDIUM_FILTER && raydiumLpSet.size && !raydiumLpSet.has(mint)) continue;
             hits.push({ type: "BURN", mint, amount: i.parsed?.info?.amount });
           }
         }
@@ -331,3 +358,4 @@ function startWs() {
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 startWs();
+```0
