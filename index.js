@@ -675,6 +675,22 @@ class RaydiumLPBurnMonitor {
      * Validate burn against criteria
      */
     validateBurn(burnInfo) {
+        // Log every burn for debugging
+        logger.info(`🔍 Validating burn: Token ${burnInfo.tokenMint?.slice(0, 8)}... Amount: ${burnInfo.burnAmount} Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}% IsLP: ${burnInfo.isLPToken}`);
+        
+        // Temporarily relaxed validation for debugging
+        // Accept ANY high percentage burn
+        if (burnInfo.burnPercentage >= 0.90) {
+            logger.info(`✅ HIGH BURN DETECTED - Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
+            
+            // Force it to be treated as LP token if high burn
+            burnInfo.isLPToken = true;
+            
+            return true;
+        }
+        
+        // Original strict validation (commented out for now)
+        /*
         // Only validate LP tokens
         if (!burnInfo.isLPToken) {
             logger.debug(`Not an LP token burn: ${burnInfo.tokenMint}`);
@@ -701,8 +717,9 @@ class RaydiumLPBurnMonitor {
                 return false;
             }
         }
+        */
         
-        return true;
+        return false;
     }
 
     /**
@@ -727,6 +744,9 @@ class RaydiumLPBurnMonitor {
      * Send burn alert to Telegram
      */
     async sendBurnAlert(signature, burnInfo) {
+        // Always log what we're trying to send
+        logger.info(`📤 Attempting to send Telegram alert for burn: ${signature.slice(0, 8)}...`);
+        
         const message = 
             `🔥🔥 *LP BURN DETECTED* 🔥🔥\n\n` +
             `📝 *Token:* \`${burnInfo.tokenMint.slice(0, 8)}...\`\n` +
@@ -739,7 +759,13 @@ class RaydiumLPBurnMonitor {
             `📈 [View on DexScreener](https://dexscreener.com/solana/${burnInfo.tokenMint})\n` +
             `🦅 [View on Birdeye](https://birdeye.so/token/${burnInfo.tokenMint})`;
         
-        await this.sendTelegramMessage(message);
+        const success = await this.sendTelegramMessage(message);
+        
+        if (success) {
+            logger.info(`✅ Telegram alert sent successfully for ${signature.slice(0, 8)}...`);
+        } else {
+            logger.error(`❌ Failed to send Telegram alert for ${signature.slice(0, 8)}...`);
+        }
     }
 
     /**
@@ -747,12 +773,16 @@ class RaydiumLPBurnMonitor {
      */
     async sendTelegramMessage(message) {
         if (!config.TG_BOT_TOKEN || !config.TG_CHAT_ID) {
-            logger.warn('Telegram credentials not configured');
-            return;
+            logger.error('❌ Telegram credentials not configured!');
+            logger.error(`TG_BOT_TOKEN: ${config.TG_BOT_TOKEN ? 'SET' : 'MISSING'}`);
+            logger.error(`TG_CHAT_ID: ${config.TG_CHAT_ID ? 'SET' : 'MISSING'}`);
+            return false;
         }
         
         try {
             const url = `https://api.telegram.org/bot${config.TG_BOT_TOKEN}/sendMessage`;
+            
+            logger.debug(`Sending to Telegram chat: ${config.TG_CHAT_ID}`);
             
             const response = await fetch(url, {
                 method: 'POST',
@@ -767,13 +797,16 @@ class RaydiumLPBurnMonitor {
             
             if (!response.ok) {
                 const error = await response.text();
-                logger.error(`Telegram error: ${error}`);
+                logger.error(`Telegram API error: ${error}`);
+                return false;
             } else {
-                logger.debug('Telegram notification sent');
+                logger.debug('Telegram notification sent successfully');
+                return true;
             }
             
         } catch (error) {
             logger.error(`Failed to send Telegram message: ${error.message}`);
+            return false;
         }
     }
 
