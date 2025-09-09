@@ -182,6 +182,8 @@ async function analyzeBurn(tx) {
         hasBurnChecked = tx.meta.logMessages.some(log => 
             log && log.includes('Instruction: BurnChecked')
         );
+        
+        console.log('Log analysis - hasPoolOps:', hasPoolOps, 'hasBurnChecked:', hasBurnChecked);
     }
     
     // Check for Raydium programs
@@ -193,6 +195,8 @@ async function analyzeBurn(tx) {
                    keyStr === 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C' ||
                    keyStr === '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
         });
+        
+        console.log('Has Raydium program:', hasRaydiumProgram);
     }
     
     // Find burns
@@ -209,52 +213,61 @@ async function analyzeBurn(tx) {
         const preAmount = BigInt(pre.uiTokenAmount.amount || 0);
         const postAmount = BigInt(post.uiTokenAmount.amount || 0);
         
+        let burnDetected = false;
+        let burnAmount = 0n;
+        
         // Check for burn to null address
         if (post.owner && BURN_ADDRESSES.includes(post.owner) && postAmount > preAmount) {
-            const burnAmount = postAmount - preAmount;
-            
+            burnAmount = postAmount - preAmount;
+            burnDetected = true;
+            console.log('Burn to null address detected');
+        }
+        // Check for direct burn (balance to 0)
+        else if (preAmount > 0n && postAmount === 0n && pre.owner && !BURN_ADDRESSES.includes(pre.owner)) {
+            burnAmount = preAmount;
+            burnDetected = true;
+            burnInfo.burner = pre.owner;
+            burnInfo.burnPercentage = 1.0;
+            console.log('Direct burn (balance to 0) detected');
+        }
+        
+        if (burnDetected) {
             burnInfo.tokenMint = pre.mint;
             burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
             
-            // Enhanced LP token detection
-            burnInfo.isLPToken = hasPoolOps || 
-                                (hasBurnChecked && hasRaydiumProgram) ||
-                                (burnInfo.burnPercentage > 0.9 && hasRaydiumProgram);
-            
-            // Find sender
-            const sender = tx.meta.preTokenBalances.find(b => 
-                b && b.mint === pre.mint && 
-                b.owner && !BURN_ADDRESSES.includes(b.owner) &&
-                BigInt(b.uiTokenAmount?.amount || 0) >= burnAmount
-            );
-            
-            if (sender && sender.owner) {
-                burnInfo.burner = sender.owner;
-                const senderPreAmount = BigInt(sender.uiTokenAmount?.amount || 0);
-                if (senderPreAmount > 0n) {
-                    burnInfo.burnPercentage = Number(burnAmount) / Number(senderPreAmount);
+            // If no burner found yet, find sender
+            if (!burnInfo.burner) {
+                const sender = tx.meta.preTokenBalances.find(b => 
+                    b && b.mint === pre.mint && 
+                    b.owner && !BURN_ADDRESSES.includes(b.owner) &&
+                    BigInt(b.uiTokenAmount?.amount || 0) >= burnAmount
+                );
+                
+                if (sender && sender.owner) {
+                    burnInfo.burner = sender.owner;
+                    const senderPreAmount = BigInt(sender.uiTokenAmount?.amount || 0);
+                    if (senderPreAmount > 0n) {
+                        burnInfo.burnPercentage = Number(burnAmount) / Number(senderPreAmount);
+                    }
                 }
             }
             
-            // Re-check LP status with burn percentage
-            if (burnInfo.burnPercentage > 0.9) {
+            // LP Token detection logic - VERY IMPORTANT
+            // If it has BurnChecked instruction, it's 99% likely an LP token burn
+            if (hasBurnChecked) {
                 burnInfo.isLPToken = true;
+                console.log('LP Token detected: BurnChecked instruction present');
             }
-            
-            return burnInfo;
-        }
-        
-        // Check for direct burn (balance to 0)
-        if (preAmount > 0n && postAmount === 0n && pre.owner && !BURN_ADDRESSES.includes(pre.owner)) {
-            burnInfo.tokenMint = pre.mint;
-            burnInfo.burnAmount = Number(preAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
-            burnInfo.burner = pre.owner;
-            burnInfo.burnPercentage = 1.0;
-            
-            // Enhanced LP token detection for 100% burns
-            burnInfo.isLPToken = hasPoolOps || 
-                                (hasBurnChecked && hasRaydiumProgram) ||
-                                hasRaydiumProgram; // 100% burns with Raydium are likely LP
+            // If high burn percentage (>90%) with any Raydium involvement
+            else if (burnInfo.burnPercentage >= 0.9 && (hasRaydiumProgram || hasPoolOps)) {
+                burnInfo.isLPToken = true;
+                console.log('LP Token detected: High burn % with Raydium context');
+            }
+            // If 100% burn, assume it's LP
+            else if (burnInfo.burnPercentage === 1.0) {
+                burnInfo.isLPToken = true;
+                console.log('LP Token detected: 100% burn');
+            }
             
             return burnInfo;
         }
