@@ -22,7 +22,7 @@ const config = {
     MIN_LP_BURN_PCT: parseFloat(process.env.MIN_LP_BURN_PCT || '0.99'),
     MIN_SOL_BURN: parseFloat(process.env.MIN_SOL_BURN || '0'),
     PORT: parseInt(process.env.PORT || '8080'),
-    RATE_MS: parseInt(process.env.RATE_MS || '12000'), // Back to 12 seconds
+    RATE_MS: parseInt(process.env.RATE_MS || '12000'),
     RPC_HTTP: process.env.RPC_HTTP,
     RPC_WSS: process.env.RPC_WSS,
     TG_BOT_TOKEN: process.env.TG_BOT_TOKEN,
@@ -71,8 +71,7 @@ class RaydiumLPBurnMonitor {
     constructor() {
         this.connection = new Connection(config.RPC_HTTP, {
             commitment: 'confirmed',
-            wsEndpoint: config.RPC_WSS,
-            confirmTransactionInitialTimeout: 60000
+            wsEndpoint: config.RPC_WSS
         });
         
         this.subscriptions = [];
@@ -81,8 +80,6 @@ class RaydiumLPBurnMonitor {
         this.tokenCache = new Map();
         this.startTime = Date.now();
         this.burnCount = 0;
-        this.retryCount = 0;
-        this.isRunning = false;
         
         logger.info('LP Burn Monitor initialized');
         logger.info(`RPC HTTP: ${config.RPC_HTTP}`);
@@ -93,75 +90,35 @@ class RaydiumLPBurnMonitor {
      * Start monitoring
      */
     async start() {
-        // Prevent multiple starts
-        if (this.isRunning) {
-            logger.warn('Monitor already running, skipping start');
-            return;
-        }
-        
-        this.isRunning = true;
-        this.transactionQueue = [];
         logger.info('🚀 Starting Raydium LP Burn Monitor...');
         
         try {
-            // Test connection with timeout
-            const versionPromise = this.connection.getVersion();
-            const timeoutPromise = new Promise((_, reject) => 
-                setTimeout(() => reject(new Error('Connection timeout')), 10000)
-            );
-            
-            const version = await Promise.race([versionPromise, timeoutPromise]);
+            // Test connection
+            const version = await this.connection.getVersion();
             logger.info(`Connected to Solana - Version: ${version['solana-core']}`);
             
             // Subscribe to various monitoring methods
             await this.subscribeToRaydiumPrograms();
             await this.subscribeToTokenPrograms();
             
-            // Send startup notification (only once)
-            if (this.burnCount === 0) {
-                await this.sendTelegramMessage(
-                    '🚀 *LP Burn Monitor Started*\n' +
-                    `⚙️ Min LP Burn: ${(config.MIN_LP_BURN_PCT * 100).toFixed(0)}%\n` +
-                    `⏱️ Min Token Age: ${config.MIN_BURN_MINT_AGE_MIN} min\n` +
-                    `💰 Min SOL Burn: ${config.MIN_SOL_BURN} SOL\n` +
-                    `🔄 Rate: ${config.RATE_MS}ms (${(config.RATE_MS/1000).toFixed(0)}s)`
-                );
-            }
+            // Send startup notification
+            await this.sendTelegramMessage(
+                '🚀 *LP Burn Monitor Started*\n' +
+                `⚙️ Min LP Burn: ${(config.MIN_LP_BURN_PCT * 100).toFixed(0)}%\n` +
+                `⏱️ Min Token Age: ${config.MIN_BURN_MINT_AGE_MIN} min\n` +
+                `💰 Min SOL Burn: ${config.MIN_SOL_BURN} SOL\n` +
+                `🔄 Rate: ${config.RATE_MS}ms`
+            );
             
             logger.info('✅ All monitoring subscriptions active');
-            logger.info(`⏱️ Rate limiting set to ${config.RATE_MS}ms between transactions`);
             
-            // Start queue processor
-            this.startQueueProcessor();
-            
-            // Periodic stats (only if not already set)
-            if (!this.statsInterval) {
-                this.statsInterval = setInterval(() => this.logStats(), 60000);
-            }
+            // Periodic stats
+            setInterval(() => this.logStats(), 60000);
             
         } catch (error) {
-            this.isRunning = false;
             logger.error(`Failed to start monitor: ${error.message}`);
             throw error;
         }
-    }
-
-    /**
-     * Start the queue processor
-     */
-    startQueueProcessor() {
-        if (this.queueProcessor) {
-            clearInterval(this.queueProcessor);
-        }
-        
-        // Process queue at regular intervals
-        this.queueProcessor = setInterval(async () => {
-            if (this.transactionQueue && this.transactionQueue.length > 0) {
-                await this.processQueue();
-            }
-        }, config.RATE_MS);
-        
-        logger.info(`Queue processor started with ${config.RATE_MS}ms interval`);
     }
 
     /**
@@ -215,16 +172,13 @@ class RaydiumLPBurnMonitor {
     async processLogs(logs, context, programId) {
         const signature = logs.signature;
         
-        // Check if already processed or queued
+        // Check if already processed
         if (this.detectedBurns.has(signature)) return;
         
         // Look for burn patterns
         if (this.detectBurnPattern(logs.logs)) {
-            const shortSig = signature.slice(0, 8);
-            logger.debug(`Potential burn detected in tx: ${shortSig}...`);
-            
-            // Queue for processing instead of immediate processing
-            this.queueTransaction(signature, context.slot);
+            logger.debug(`Potential burn detected in tx: ${signature}`);
+            await this.analyzeTransaction(signature, context.slot);
         }
     }
 
@@ -234,19 +188,9 @@ class RaydiumLPBurnMonitor {
     async processTokenLogs(logs, context) {
         const signature = logs.signature;
         
-        // Check if already processed or queued
         if (this.detectedBurns.has(signature)) return;
         
         const logMessages = logs.logs || [];
-        
-        // Only process if Raydium is involved
-        const hasRaydium = logMessages.some(msg => 
-            msg.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8') ||
-            msg.includes('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK') ||
-            msg.includes('CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C')
-        );
-        
-        if (!hasRaydium) return;
         
         // Check for burn instructions or transfers to burn addresses
         for (const message of logMessages) {
@@ -254,57 +198,11 @@ class RaydiumLPBurnMonitor {
                 message.includes('Instruction: BurnChecked') ||
                 this.containsBurnAddress(message)) {
                 
-                const shortSig = signature.slice(0, 8);
-                logger.debug(`LP Token burn detected in tx: ${shortSig}...`);
-                
-                // Queue for processing instead of immediate processing
-                this.queueTransaction(signature, context.slot);
+                logger.debug(`Token burn detected in tx: ${signature}`);
+                await this.analyzeTransaction(signature, context.slot);
                 break;
             }
         }
-    }
-
-    /**
-     * Queue transaction for processing
-     */
-    queueTransaction(signature, slot) {
-        if (!this.transactionQueue) {
-            this.transactionQueue = [];
-        }
-        
-        // Check if already processed or in queue
-        if (this.detectedBurns.has(signature)) {
-            return;
-        }
-        
-        // Add to queue if not already there
-        const exists = this.transactionQueue.find(tx => tx.signature === signature);
-        if (!exists) {
-            this.transactionQueue.push({ signature, slot, timestamp: Date.now() });
-            logger.info(`📥 Queued transaction: ${signature.slice(0, 8)}... (queue size: ${this.transactionQueue.length})`);
-        }
-    }
-
-    /**
-     * Process queued transactions with proper rate limiting
-     */
-    async processQueue() {
-        if (!this.transactionQueue || this.transactionQueue.length === 0) {
-            return;
-        }
-        
-        // Get next transaction from queue
-        const tx = this.transactionQueue.shift();
-        
-        if (!tx) return;
-        
-        logger.debug(`Processing queued tx: ${tx.signature} (queue size: ${this.transactionQueue.length})`);
-        
-        // Process the transaction
-        await this.analyzeTransaction(tx.signature, tx.slot);
-        
-        // Wait for the configured rate limit
-        await this.sleep(config.RATE_MS);
     }
 
     /**
@@ -314,26 +212,10 @@ class RaydiumLPBurnMonitor {
         if (!logs) return false;
         
         for (const log of logs) {
-            // SKIP swap transactions completely
-            if (log.toLowerCase().includes('swap') || 
-                log.toLowerCase().includes('jupiter') ||
-                log.toLowerCase().includes('aggregator')) {
-                return false; // This is a swap, not a burn
-            }
-            
-            // Check for real burn patterns
+            // Check for burn-related keywords
             if (log.toLowerCase().includes('burn') ||
                 log.toLowerCase().includes('remove liquidity') ||
-                log.includes('Instruction: BurnChecked') ||
-                log.includes('Instruction: Burn')) {
-                // Additional check: make sure it's not just a swap with burn in the name
-                if (!log.toLowerCase().includes('swap')) {
-                    return true;
-                }
-            }
-            
-            // Check for burn addresses
-            if (this.containsBurnAddress(log)) {
+                this.containsBurnAddress(log)) {
                 return true;
             }
         }
@@ -358,57 +240,20 @@ class RaydiumLPBurnMonitor {
      */
     async analyzeTransaction(signature, slot) {
         try {
-            // Check if already processed
-            if (this.detectedBurns.has(signature)) {
-                return;
-            }
-            
-            // Mark as processing
+            // Mark as processed
             this.detectedBurns.set(signature, true);
             
-            // NO additional delay here since we're already rate limited by the queue processor
+            // Rate limiting
+            await this.sleep(config.RATE_MS);
             
-            // Fetch transaction with retry logic
-            let tx = null;
-            let retries = 3;
-            const baseDelay = 5000; // 5 second base retry delay
-            
-            while (retries > 0 && !tx) {
-                try {
-                    tx = await this.connection.getTransaction(signature, {
-                        maxSupportedTransactionVersion: 0,
-                        commitment: 'confirmed'
-                    });
-                    
-                    // Reset retry count on success
-                    this.retryCount = 0;
-                    
-                } catch (error) {
-                    const errorMessage = error.message || error.toString();
-                    
-                    if (errorMessage.includes('429') || errorMessage.includes('Too Many Requests')) {
-                        this.retryCount = (this.retryCount || 0) + 1;
-                        const waitTime = Math.min(baseDelay * Math.pow(2, this.retryCount), 120000);
-                        logger.warn(`Rate limit hit, waiting ${waitTime}ms before retry...`);
-                        await this.sleep(waitTime);
-                        retries--;
-                    } else if (errorMessage.includes('timeout')) {
-                        logger.warn(`Timeout fetching tx, retrying...`);
-                        await this.sleep(baseDelay);
-                        retries--;
-                    } else {
-                        logger.error(`Error fetching tx: ${errorMessage}`);
-                        // Remove from processed to retry later
-                        this.detectedBurns.delete(signature);
-                        return;
-                    }
-                }
-            }
+            // Fetch transaction
+            const tx = await this.connection.getTransaction(signature, {
+                maxSupportedTransactionVersion: 0,
+                commitment: 'confirmed'
+            });
             
             if (!tx || !tx.meta) {
                 logger.debug(`No transaction data for: ${signature}`);
-                // Remove from processed to retry later
-                this.detectedBurns.delete(signature);
                 return;
             }
             
@@ -422,8 +267,6 @@ class RaydiumLPBurnMonitor {
             
         } catch (error) {
             logger.error(`Error analyzing tx ${signature}: ${error.message}`);
-            // Remove from processed to retry later
-            this.detectedBurns.delete(signature);
         }
     }
 
@@ -431,288 +274,91 @@ class RaydiumLPBurnMonitor {
      * Extract burn information from transaction
      */
     async extractBurnInfo(tx) {
-        try {
-            if (!tx || !tx.meta) {
-                return null;
-            }
-            
-            const { meta, transaction } = tx;
-            
-            if (!meta.postTokenBalances || !meta.preTokenBalances) {
-                return null;
-            }
-            
-            // IMPORTANT: Skip swap transactions
-            if (meta.logMessages) {
-                const isSwap = meta.logMessages.some(log => 
-                    log && (
-                        log.toLowerCase().includes('swap') ||
-                        log.toLowerCase().includes('jupiter') ||
-                        log.toLowerCase().includes('aggregator') ||
-                        log.toLowerCase().includes('route')
-                    )
-                );
-                
-                if (isSwap) {
-                    logger.debug('Skipping swap transaction');
-                    return null; // This is a swap, not a burn
-                }
-                
-                // Check for real burn instructions
-                const hasBurnInstruction = meta.logMessages.some(log =>
-                    log && (
-                        log.includes('Instruction: Burn') ||
-                        log.includes('Instruction: BurnChecked') ||
-                        log.includes('RemoveLiquidity')
-                    )
-                );
-                
-                if (!hasBurnInstruction) {
-                    logger.debug('No burn instruction found in transaction');
-                    return null;
-                }
-            }
-            
-            const burnInfo = {
-                tokenMint: null,
-                burnAmount: 0,
-                burnPercentage: 0,
-                burner: null,
-                poolId: null,
-                timestamp: tx.blockTime,
-                solValue: 0,
-                isLPToken: false
-            };
-            
-            // Safely check for Raydium programs
-            let hasRaydiumProgram = false;
-            if (transaction?.message?.accountKeys) {
-                hasRaydiumProgram = transaction.message.accountKeys.some(key => {
-                    if (!key || !key.toBase58) return false;
-                    const keyStr = key.toBase58();
-                    return keyStr === '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8' ||
-                           keyStr === 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK' ||
-                           keyStr === 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
-                });
-            }
-            
-            // Find LP token burns
-            for (let i = 0; i < meta.preTokenBalances.length; i++) {
-                const pre = meta.preTokenBalances[i];
-                if (!pre || !pre.uiTokenAmount) continue;
-                
-                const post = meta.postTokenBalances.find(p => 
-                    p && p.accountIndex === pre.accountIndex
-                );
-                
-                if (!post || !post.uiTokenAmount) continue;
-                
-                const preAmount = BigInt(pre.uiTokenAmount.amount || 0);
-                const postAmount = BigInt(post.uiTokenAmount.amount || 0);
-                
-                // Check if this is a burn (transfer to burn address)
-                if (post.owner && BURN_ADDRESSES.includes(post.owner) && postAmount > preAmount) {
-                    // Tokens received at burn address
-                    const burnAmount = postAmount - preAmount;
-                    
-                    burnInfo.tokenMint = pre.mint;
-                    burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
-                    
-                    // Check if this is an LP token
-                    burnInfo.isLPToken = await this.isLPToken(pre.mint, tx);
-                    
-                    // Find the sender
-                    const sender = meta.preTokenBalances.find(b => 
-                        b && b.mint === pre.mint && 
-                        b.owner && !BURN_ADDRESSES.includes(b.owner) &&
-                        BigInt(b.uiTokenAmount?.amount || 0) >= burnAmount
-                    );
-                    
-                    if (sender && sender.owner) {
-                        burnInfo.burner = sender.owner;
-                        
-                        // Calculate burn percentage
-                        const senderPreAmount = BigInt(sender.uiTokenAmount?.amount || 0);
-                        if (senderPreAmount > 0n) {
-                            burnInfo.burnPercentage = Number(burnAmount) / Number(senderPreAmount);
-                        }
-                    }
-                }
-                
-                // Alternative: Check for direct burns (amount decrease to 0)
-                if (preAmount > 0n && postAmount === 0n && pre.owner && !BURN_ADDRESSES.includes(pre.owner)) {
-                    const burnAmount = preAmount;
-                    
-                    burnInfo.tokenMint = pre.mint;
-                    burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
-                    burnInfo.burner = pre.owner;
-                    burnInfo.burnPercentage = 1.0; // 100% burn
-                    burnInfo.isLPToken = await this.isLPToken(pre.mint, tx);
-                }
-            }
-            
-            // Only return if it's an LP token or involves Raydium
-            if (!burnInfo.isLPToken && !hasRaydiumProgram) {
-                return null;
-            }
-            
-            // Try to identify pool
-            burnInfo.poolId = await this.identifyPool(tx);
-            
-            // Estimate SOL value
-            burnInfo.solValue = await this.estimateSolValue(burnInfo);
-            
-            return burnInfo.tokenMint ? burnInfo : null;
-            
-        } catch (error) {
-            logger.error(`Error extracting burn info: ${error.message}`);
+        const { meta, transaction } = tx;
+        
+        if (!meta.postTokenBalances || !meta.preTokenBalances) {
             return null;
         }
-    }
-    
-    /**
-     * Check if token is an LP token
-     */
-    async isLPToken(mintAddress, tx) {
-        try {
-            // CRITICAL: Skip if this is a swap transaction
-            if (tx?.meta?.logMessages) {
-                const isSwap = tx.meta.logMessages.some(log => 
-                    log && (
-                        log.toLowerCase().includes('swap') ||
-                        log.toLowerCase().includes('jupiter') ||
-                        log.toLowerCase().includes('aggregator')
-                    )
+        
+        const burnInfo = {
+            tokenMint: null,
+            burnAmount: 0,
+            burnPercentage: 0,
+            burner: null,
+            poolId: null,
+            timestamp: tx.blockTime,
+            solValue: 0
+        };
+        
+        // Find LP token burns
+        for (let i = 0; i < meta.preTokenBalances.length; i++) {
+            const pre = meta.preTokenBalances[i];
+            const post = meta.postTokenBalances.find(p => 
+                p.accountIndex === pre.accountIndex
+            );
+            
+            if (!post) continue;
+            
+            const preAmount = BigInt(pre.uiTokenAmount.amount || 0);
+            const postAmount = BigInt(post.uiTokenAmount.amount || 0);
+            
+            // Check if this is a burn (transfer to burn address)
+            if (BURN_ADDRESSES.includes(pre.owner) && postAmount > preAmount) {
+                // Tokens received at burn address
+                const burnAmount = postAmount - preAmount;
+                
+                burnInfo.tokenMint = pre.mint;
+                burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals);
+                
+                // Find the sender
+                const sender = meta.preTokenBalances.find(b => 
+                    b.mint === pre.mint && !BURN_ADDRESSES.includes(b.owner)
                 );
                 
-                if (isSwap) {
-                    logger.debug('Not an LP token - this is a swap transaction');
-                    return false;
-                }
-                
-                // Check for BurnChecked - strongest indicator of LP burn
-                const hasBurnChecked = tx.meta.logMessages.some(log => 
-                    log && (
-                        log.includes('Instruction: BurnChecked') ||
-                        log.includes('Instruction: Burn')
-                    )
-                );
-                
-                if (hasBurnChecked) {
-                    // Additional check: must have Raydium context
-                    const hasRaydiumContext = tx.transaction?.message?.accountKeys?.some(key => {
-                        if (!key || !key.toBase58) return false;
-                        const keyStr = key.toBase58();
-                        return keyStr === '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8' ||
-                               keyStr === 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK' ||
-                               keyStr === 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
-                    });
+                if (sender) {
+                    burnInfo.burner = sender.owner;
                     
-                    if (hasRaydiumContext) {
-                        logger.debug('LP Token identified: BurnChecked with Raydium');
-                        return true;
+                    // Calculate burn percentage
+                    const senderPreAmount = BigInt(sender.uiTokenAmount.amount || 0);
+                    if (senderPreAmount > 0n) {
+                        burnInfo.burnPercentage = Number(burnAmount) / Number(senderPreAmount);
                     }
                 }
-                
-                // Check for pool/liquidity operations (but not swaps)
-                const hasPoolOps = tx.meta.logMessages.some(log => 
-                    log && !log.toLowerCase().includes('swap') && (
-                        log.toLowerCase().includes('remove liquidity') ||
-                        log.toLowerCase().includes('removeliquidity') ||
-                        log.toLowerCase().includes('lp token') ||
-                        log.toLowerCase().includes('liquidity pool')
-                    )
-                );
-                
-                if (hasPoolOps) {
-                    logger.debug('LP Token identified: Pool operations in logs');
-                    return true;
-                }
             }
-            
-            // Check cache
-            if (this.tokenCache.has(mintAddress)) {
-                return this.tokenCache.get(mintAddress).isLP;
-            }
-            
-            return false;
-        } catch (error) {
-            logger.debug(`Error checking LP token status: ${error.message}`);
-            return false;
         }
-    }
-    
-    /**
-     * Helper to get current burn percentage from transaction
-     */
-    getCurrentBurnPercentage(tx) {
-        try {
-            if (!tx?.meta?.preTokenBalances || !tx?.meta?.postTokenBalances) {
-                return 0;
-            }
-            
-            for (const pre of tx.meta.preTokenBalances) {
-                if (!pre || !pre.uiTokenAmount) continue;
-                
-                const post = tx.meta.postTokenBalances.find(p => 
-                    p && p.accountIndex === pre.accountIndex
-                );
-                
-                if (!post || !post.uiTokenAmount) continue;
-                
-                const preAmount = BigInt(pre.uiTokenAmount.amount || 0);
-                const postAmount = BigInt(post.uiTokenAmount.amount || 0);
-                
-                // Check for significant burn
-                if (preAmount > 0n && postAmount < preAmount) {
-                    const burnAmount = preAmount - postAmount;
-                    return Number(burnAmount) / Number(preAmount);
-                }
-            }
-            
-            return 0;
-        } catch (error) {
-            return 0;
-        }
+        
+        // Try to identify pool
+        burnInfo.poolId = await this.identifyPool(tx);
+        
+        // Estimate SOL value
+        burnInfo.solValue = await this.estimateSolValue(burnInfo);
+        
+        return burnInfo.tokenMint ? burnInfo : null;
     }
 
     /**
      * Identify pool from transaction
      */
     async identifyPool(tx) {
-        try {
-            if (!tx?.transaction?.message?.instructions) {
-                return null;
-            }
+        const instructions = tx.transaction.message.instructions || [];
+        
+        for (const ix of instructions) {
+            const programId = tx.transaction.message.accountKeys[ix.programIdIndex];
             
-            const instructions = tx.transaction.message.instructions;
-            
-            for (const ix of instructions) {
-                if (!ix || typeof ix.programIdIndex === 'undefined') continue;
-                
-                const accountKeys = tx.transaction.message.accountKeys;
-                if (!accountKeys || !accountKeys[ix.programIdIndex]) continue;
-                
-                const programId = accountKeys[ix.programIdIndex];
-                
-                // Check if Raydium instruction
-                if (programId && programId.equals && (
-                    programId.equals(RAYDIUM_LIQUIDITY_POOL_V4) ||
-                    programId.equals(RAYDIUM_AMM_PROGRAM) ||
-                    programId.equals(RAYDIUM_CPMM_PROGRAM)
-                )) {
-                    // First account is usually the pool
-                    if (ix.accounts && ix.accounts.length > 0 && accountKeys[ix.accounts[0]]) {
-                        return accountKeys[ix.accounts[0]].toBase58();
-                    }
+            // Check if Raydium instruction
+            if (programId && (
+                programId.equals(RAYDIUM_LIQUIDITY_POOL_V4) ||
+                programId.equals(RAYDIUM_AMM_PROGRAM) ||
+                programId.equals(RAYDIUM_CPMM_PROGRAM)
+            )) {
+                // First account is usually the pool
+                if (ix.accounts && ix.accounts.length > 0) {
+                    return tx.transaction.message.accountKeys[ix.accounts[0]].toBase58();
                 }
             }
-            
-            return null;
-        } catch (error) {
-            logger.debug(`Error identifying pool: ${error.message}`);
-            return null;
         }
+        
+        return null;
     }
 
     /**
@@ -728,28 +374,27 @@ class RaydiumLPBurnMonitor {
      * Validate burn against criteria
      */
     validateBurn(burnInfo) {
-        // Log every burn for debugging
-        logger.info(`🔍 Validating burn: Token ${burnInfo.tokenMint?.slice(0, 8)}... Amount: ${burnInfo.burnAmount} Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}% IsLP: ${burnInfo.isLPToken}`);
-        
-        // Must be an LP token
-        if (!burnInfo.isLPToken) {
-            logger.debug(`Not an LP token burn: ${burnInfo.tokenMint}`);
-            return false;
-        }
-        
         // Check burn percentage
         if (burnInfo.burnPercentage < config.MIN_LP_BURN_PCT) {
-            logger.debug(`LP burn percentage too low: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
+            logger.debug(`Burn percentage too low: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
             return false;
         }
         
-        // Check SOL value (optional)
-        if (config.MIN_SOL_BURN > 0 && burnInfo.solValue < config.MIN_SOL_BURN) {
+        // Check SOL value
+        if (burnInfo.solValue < config.MIN_SOL_BURN) {
             logger.debug(`SOL value too low: ${burnInfo.solValue} SOL`);
             return false;
         }
         
-        logger.info(`✅ VALID LP BURN - Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
+        // Check token age (if we have creation time)
+        if (burnInfo.timestamp) {
+            const ageMinutes = (Date.now() / 1000 - burnInfo.timestamp) / 60;
+            if (ageMinutes < config.MIN_BURN_MINT_AGE_MIN) {
+                logger.debug(`Token too new: ${ageMinutes.toFixed(0)} minutes`);
+                return false;
+            }
+        }
+        
         return true;
     }
 
@@ -757,12 +402,9 @@ class RaydiumLPBurnMonitor {
      * Handle valid LP burn
      */
     async handleValidBurn(signature, burnInfo, slot) {
-        const shortSig = signature.slice(0, 8);
-        const shortMint = burnInfo.tokenMint ? burnInfo.tokenMint.slice(0, 8) : 'Unknown';
-        
         logger.info(`🔥 VALID LP BURN DETECTED!`);
-        logger.info(`  Signature: ${shortSig}...`);
-        logger.info(`  Token: ${shortMint}...`);
+        logger.info(`  Signature: ${signature}`);
+        logger.info(`  Token: ${burnInfo.tokenMint}`);
         logger.info(`  Amount: ${burnInfo.burnAmount.toFixed(2)}`);
         logger.info(`  Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
         logger.info(`  SOL Value: ~${burnInfo.solValue.toFixed(3)} SOL`);
@@ -775,9 +417,6 @@ class RaydiumLPBurnMonitor {
      * Send burn alert to Telegram
      */
     async sendBurnAlert(signature, burnInfo) {
-        // Always log what we're trying to send
-        logger.info(`📤 Attempting to send Telegram alert for burn: ${signature.slice(0, 8)}...`);
-        
         const message = 
             `🔥🔥 *LP BURN DETECTED* 🔥🔥\n\n` +
             `📝 *Token:* \`${burnInfo.tokenMint.slice(0, 8)}...\`\n` +
@@ -790,13 +429,7 @@ class RaydiumLPBurnMonitor {
             `📈 [View on DexScreener](https://dexscreener.com/solana/${burnInfo.tokenMint})\n` +
             `🦅 [View on Birdeye](https://birdeye.so/token/${burnInfo.tokenMint})`;
         
-        const success = await this.sendTelegramMessage(message);
-        
-        if (success) {
-            logger.info(`✅ Telegram alert sent successfully for ${signature.slice(0, 8)}...`);
-        } else {
-            logger.error(`❌ Failed to send Telegram alert for ${signature.slice(0, 8)}...`);
-        }
+        await this.sendTelegramMessage(message);
     }
 
     /**
@@ -804,16 +437,12 @@ class RaydiumLPBurnMonitor {
      */
     async sendTelegramMessage(message) {
         if (!config.TG_BOT_TOKEN || !config.TG_CHAT_ID) {
-            logger.error('❌ Telegram credentials not configured!');
-            logger.error(`TG_BOT_TOKEN: ${config.TG_BOT_TOKEN ? 'SET' : 'MISSING'}`);
-            logger.error(`TG_CHAT_ID: ${config.TG_CHAT_ID ? 'SET' : 'MISSING'}`);
-            return false;
+            logger.warn('Telegram credentials not configured');
+            return;
         }
         
         try {
             const url = `https://api.telegram.org/bot${config.TG_BOT_TOKEN}/sendMessage`;
-            
-            logger.debug(`Sending to Telegram chat: ${config.TG_CHAT_ID}`);
             
             const response = await fetch(url, {
                 method: 'POST',
@@ -828,16 +457,13 @@ class RaydiumLPBurnMonitor {
             
             if (!response.ok) {
                 const error = await response.text();
-                logger.error(`Telegram API error: ${error}`);
-                return false;
+                logger.error(`Telegram error: ${error}`);
             } else {
-                logger.debug('Telegram notification sent successfully');
-                return true;
+                logger.debug('Telegram notification sent');
             }
             
         } catch (error) {
             logger.error(`Failed to send Telegram message: ${error.message}`);
-            return false;
         }
     }
 
@@ -849,9 +475,7 @@ class RaydiumLPBurnMonitor {
         const hours = Math.floor(runtime / (1000 * 60 * 60));
         const minutes = Math.floor((runtime % (1000 * 60 * 60)) / (1000 * 60));
         
-        const queueSize = this.transactionQueue ? this.transactionQueue.length : 0;
-        
-        logger.info(`📊 Stats - Runtime: ${hours}h ${minutes}m, Burns: ${this.burnCount}, Cache: ${this.detectedBurns.size} txs, Queue: ${queueSize} pending`);
+        logger.info(`📊 Stats - Runtime: ${hours}h ${minutes}m, Burns: ${this.burnCount}, Cache: ${this.detectedBurns.size} txs`);
         
         // Clean old cache entries
         if (this.detectedBurns.size > 10000) {
@@ -861,18 +485,6 @@ class RaydiumLPBurnMonitor {
                 this.detectedBurns.delete(keys[i]);
             }
             logger.debug(`Cleaned ${toDelete} old cache entries`);
-        }
-        
-        // Clean old queue entries (older than 10 minutes)
-        if (this.transactionQueue && this.transactionQueue.length > 0) {
-            const now = Date.now();
-            const oldLength = this.transactionQueue.length;
-            this.transactionQueue = this.transactionQueue.filter(tx => 
-                (now - tx.timestamp) < 600000 // 10 minutes
-            );
-            if (oldLength > this.transactionQueue.length) {
-                logger.debug(`Cleaned ${oldLength - this.transactionQueue.length} old queue entries`);
-            }
         }
     }
 
@@ -887,26 +499,8 @@ class RaydiumLPBurnMonitor {
      * Stop monitoring
      */
     async stop() {
-        if (!this.isRunning) {
-            logger.info('Monitor not running');
-            return;
-        }
-        
         logger.info('Stopping monitor...');
-        this.isRunning = false;
         
-        // Clear intervals
-        if (this.statsInterval) {
-            clearInterval(this.statsInterval);
-            this.statsInterval = null;
-        }
-        
-        if (this.queueProcessor) {
-            clearInterval(this.queueProcessor);
-            this.queueProcessor = null;
-        }
-        
-        // Remove subscriptions
         for (const subId of this.subscriptions) {
             try {
                 await this.connection.removeOnLogsListener(subId);
@@ -914,9 +508,6 @@ class RaydiumLPBurnMonitor {
                 // Ignore
             }
         }
-        
-        this.subscriptions = [];
-        this.transactionQueue = [];
         
         await this.sendTelegramMessage(
             `🛑 *LP Burn Monitor Stopped*\n` +
@@ -981,26 +572,9 @@ async function main() {
             process.exit(0);
         });
         
-        // Handle uncaught errors to prevent crashes
-        process.on('uncaughtException', (error) => {
-            logger.error(`Uncaught Exception: ${error.message}`);
-            logger.error(error.stack);
-            // Don't exit, try to recover
-        });
-        
-        process.on('unhandledRejection', (reason, promise) => {
-            logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
-            // Don't exit, try to recover
-        });
-        
     } catch (error) {
         logger.error(`Fatal error: ${error.message}`);
-        
-        // Try to restart after delay
-        setTimeout(() => {
-            logger.info('Attempting to restart after error...');
-            main();
-        }, 30000); // Wait 30 seconds before restart
+        process.exit(1);
     }
 }
 
