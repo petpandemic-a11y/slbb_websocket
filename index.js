@@ -528,9 +528,23 @@ class RaydiumLPBurnMonitor {
      */
     async isLPToken(mintAddress, tx) {
         try {
-            // Method 1: Check if the transaction involves pool operations
+            let hasBurnChecked = false;
+            let hasPoolOps = false;
+            
+            // Method 1: Check logs
             if (tx?.meta?.logMessages) {
-                const hasPoolOps = tx.meta.logMessages.some(log => 
+                // Check for BurnChecked - strongest indicator
+                hasBurnChecked = tx.meta.logMessages.some(log => 
+                    log && log.includes('Instruction: BurnChecked')
+                );
+                
+                if (hasBurnChecked) {
+                    logger.debug('LP Token identified: BurnChecked instruction');
+                    return true; // BurnChecked = almost certainly LP token
+                }
+                
+                // Check for pool operations
+                hasPoolOps = tx.meta.logMessages.some(log => 
                     log && (
                         log.toLowerCase().includes('pool') || 
                         log.toLowerCase().includes('liquidity') ||
@@ -540,50 +554,38 @@ class RaydiumLPBurnMonitor {
                     )
                 );
                 
-                if (hasPoolOps) return true;
-            }
-            
-            // Method 2: Check if this is a BurnChecked instruction (LP tokens often use this)
-            if (tx?.meta?.logMessages) {
-                const hasBurnChecked = tx.meta.logMessages.some(log => 
-                    log && log.includes('Instruction: BurnChecked')
-                );
-                
-                if (hasBurnChecked) {
-                    // If BurnChecked is used with Raydium context, it's likely an LP token
-                    const hasRaydiumContext = tx.transaction?.message?.accountKeys?.some(key => {
-                        if (!key || !key.toBase58) return false;
-                        const keyStr = key.toBase58();
-                        return keyStr.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8') ||
-                               keyStr.includes('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK') ||
-                               keyStr.includes('CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C') ||
-                               keyStr.includes('5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1');
-                    });
-                    
-                    if (hasRaydiumContext) return true;
+                if (hasPoolOps) {
+                    logger.debug('LP Token identified: Pool operations in logs');
+                    return true;
                 }
             }
             
-            // Method 3: Check mint address pattern
-            // Many LP tokens have specific patterns in their mint addresses
-            // or are created by Raydium's authority
+            // Method 2: Check burn percentage
+            const burnPercentage = this.getCurrentBurnPercentage(tx);
             
-            // Method 4: Check if this mint is in our LP token cache
-            if (this.tokenCache.has(mintAddress)) {
-                return this.tokenCache.get(mintAddress).isLP;
+            // 100% burns are almost always LP burns
+            if (burnPercentage === 1.0) {
+                logger.debug('LP Token identified: 100% burn');
+                return true;
             }
             
-            // Method 5: If it's a large burn (>90%) in a Raydium context, assume it's LP
-            // This is a heuristic but works well in practice
-            const burnPercentage = this.getCurrentBurnPercentage(tx);
+            // High percentage burns (>90%) are likely LP
             if (burnPercentage > 0.9) {
-                return true; // High percentage burns are typically LP burns
+                logger.debug('LP Token identified: High burn percentage');
+                return true;
+            }
+            
+            // Method 3: Check cache
+            if (this.tokenCache.has(mintAddress)) {
+                return this.tokenCache.get(mintAddress).isLP;
             }
             
             return false;
         } catch (error) {
             logger.debug(`Error checking LP token status: ${error.message}`);
-            return false;
+            // On error, if we have a high burn %, assume it's LP
+            const burnPercentage = this.getCurrentBurnPercentage(tx);
+            return burnPercentage > 0.9;
         }
     }
     
