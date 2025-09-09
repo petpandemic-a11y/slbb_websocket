@@ -100,6 +100,7 @@ class RaydiumLPBurnMonitor {
         }
         
         this.isRunning = true;
+        this.transactionQueue = [];
         logger.info('🚀 Starting Raydium LP Burn Monitor...');
         
         try {
@@ -123,11 +124,15 @@ class RaydiumLPBurnMonitor {
                     `⚙️ Min LP Burn: ${(config.MIN_LP_BURN_PCT * 100).toFixed(0)}%\n` +
                     `⏱️ Min Token Age: ${config.MIN_BURN_MINT_AGE_MIN} min\n` +
                     `💰 Min SOL Burn: ${config.MIN_SOL_BURN} SOL\n` +
-                    `🔄 Rate: ${config.RATE_MS}ms`
+                    `🔄 Rate: ${config.RATE_MS}ms (${(config.RATE_MS/1000).toFixed(0)}s)`
                 );
             }
             
             logger.info('✅ All monitoring subscriptions active');
+            logger.info(`⏱️ Rate limiting set to ${config.RATE_MS}ms between transactions`);
+            
+            // Start queue processor
+            this.startQueueProcessor();
             
             // Periodic stats (only if not already set)
             if (!this.statsInterval) {
@@ -139,6 +144,24 @@ class RaydiumLPBurnMonitor {
             logger.error(`Failed to start monitor: ${error.message}`);
             throw error;
         }
+    }
+
+    /**
+     * Start the queue processor
+     */
+    startQueueProcessor() {
+        if (this.queueProcessor) {
+            clearInterval(this.queueProcessor);
+        }
+        
+        // Process queue at regular intervals
+        this.queueProcessor = setInterval(async () => {
+            if (this.transactionQueue && this.transactionQueue.length > 0) {
+                await this.processQueue();
+            }
+        }, config.RATE_MS);
+        
+        logger.info(`Queue processor started with ${config.RATE_MS}ms interval`);
     }
 
     /**
@@ -198,7 +221,9 @@ class RaydiumLPBurnMonitor {
         // Look for burn patterns
         if (this.detectBurnPattern(logs.logs)) {
             logger.debug(`Potential burn detected in tx: ${signature}`);
-            await this.analyzeTransaction(signature, context.slot);
+            
+            // Queue for processing instead of immediate processing
+            this.queueTransaction(signature, context.slot);
         }
     }
 
@@ -228,10 +253,49 @@ class RaydiumLPBurnMonitor {
                 this.containsBurnAddress(message)) {
                 
                 logger.debug(`LP Token burn detected in tx: ${signature}`);
-                await this.analyzeTransaction(signature, context.slot);
+                
+                // Queue for processing instead of immediate processing
+                this.queueTransaction(signature, context.slot);
                 break;
             }
         }
+    }
+
+    /**
+     * Queue transaction for processing
+     */
+    queueTransaction(signature, slot) {
+        if (!this.transactionQueue) {
+            this.transactionQueue = [];
+        }
+        
+        // Add to queue if not already there
+        if (!this.transactionQueue.find(tx => tx.signature === signature)) {
+            this.transactionQueue.push({ signature, slot, timestamp: Date.now() });
+            logger.debug(`Queued transaction: ${signature}`);
+        }
+    }
+
+    /**
+     * Process queued transactions with proper rate limiting
+     */
+    async processQueue() {
+        if (!this.transactionQueue || this.transactionQueue.length === 0) {
+            return;
+        }
+        
+        // Get next transaction from queue
+        const tx = this.transactionQueue.shift();
+        
+        if (!tx) return;
+        
+        logger.debug(`Processing queued tx: ${tx.signature} (queue size: ${this.transactionQueue.length})`);
+        
+        // Process the transaction
+        await this.analyzeTransaction(tx.signature, tx.slot);
+        
+        // Wait for the configured rate limit
+        await this.sleep(config.RATE_MS);
     }
 
     /**
@@ -277,20 +341,12 @@ class RaydiumLPBurnMonitor {
             // Mark as processing
             this.detectedBurns.set(signature, true);
             
-            // Add exponential backoff for rate limiting
-            const baseDelay = config.RATE_MS;
-            const retryCount = this.retryCount || 0;
-            const retryDelay = Math.min(baseDelay * Math.pow(2, retryCount), 120000); // Max 2 minutes
-            
-            if (retryCount > 0) {
-                logger.warn(`Rate limited, waiting ${retryDelay}ms before retry (attempt ${retryCount + 1})...`);
-            }
-            
-            await this.sleep(retryDelay);
+            // NO additional delay here since we're already rate limited by the queue processor
             
             // Fetch transaction with retry logic
             let tx = null;
             let retries = 3;
+            const baseDelay = 5000; // 5 second base retry delay
             
             while (retries > 0 && !tx) {
                 try {
@@ -313,7 +369,7 @@ class RaydiumLPBurnMonitor {
                         retries--;
                     } else if (errorMessage.includes('timeout')) {
                         logger.warn(`Timeout fetching tx, retrying...`);
-                        await this.sleep(5000);
+                        await this.sleep(baseDelay);
                         retries--;
                     } else {
                         logger.error(`Error fetching tx: ${errorMessage}`);
@@ -654,7 +710,9 @@ class RaydiumLPBurnMonitor {
         const hours = Math.floor(runtime / (1000 * 60 * 60));
         const minutes = Math.floor((runtime % (1000 * 60 * 60)) / (1000 * 60));
         
-        logger.info(`📊 Stats - Runtime: ${hours}h ${minutes}m, Burns: ${this.burnCount}, Cache: ${this.detectedBurns.size} txs`);
+        const queueSize = this.transactionQueue ? this.transactionQueue.length : 0;
+        
+        logger.info(`📊 Stats - Runtime: ${hours}h ${minutes}m, Burns: ${this.burnCount}, Cache: ${this.detectedBurns.size} txs, Queue: ${queueSize} pending`);
         
         // Clean old cache entries
         if (this.detectedBurns.size > 10000) {
@@ -664,6 +722,18 @@ class RaydiumLPBurnMonitor {
                 this.detectedBurns.delete(keys[i]);
             }
             logger.debug(`Cleaned ${toDelete} old cache entries`);
+        }
+        
+        // Clean old queue entries (older than 10 minutes)
+        if (this.transactionQueue && this.transactionQueue.length > 0) {
+            const now = Date.now();
+            const oldLength = this.transactionQueue.length;
+            this.transactionQueue = this.transactionQueue.filter(tx => 
+                (now - tx.timestamp) < 600000 // 10 minutes
+            );
+            if (oldLength > this.transactionQueue.length) {
+                logger.debug(`Cleaned ${oldLength - this.transactionQueue.length} old queue entries`);
+            }
         }
     }
 
@@ -686,10 +756,15 @@ class RaydiumLPBurnMonitor {
         logger.info('Stopping monitor...');
         this.isRunning = false;
         
-        // Clear interval
+        // Clear intervals
         if (this.statsInterval) {
             clearInterval(this.statsInterval);
             this.statsInterval = null;
+        }
+        
+        if (this.queueProcessor) {
+            clearInterval(this.queueProcessor);
+            this.queueProcessor = null;
         }
         
         // Remove subscriptions
@@ -702,6 +777,7 @@ class RaydiumLPBurnMonitor {
         }
         
         this.subscriptions = [];
+        this.transactionQueue = [];
         
         await this.sendTelegramMessage(
             `🛑 *LP Burn Monitor Stopped*\n` +
