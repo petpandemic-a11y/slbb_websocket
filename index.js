@@ -22,7 +22,7 @@ const config = {
     MIN_LP_BURN_PCT: parseFloat(process.env.MIN_LP_BURN_PCT || '0.99'),
     MIN_SOL_BURN: parseFloat(process.env.MIN_SOL_BURN || '0'),
     PORT: parseInt(process.env.PORT || '8080'),
-    RATE_MS: parseInt(process.env.RATE_MS || '30000'), // Increased to 30 seconds
+    RATE_MS: parseInt(process.env.RATE_MS || '12000'), // Back to 12 seconds
     RPC_HTTP: process.env.RPC_HTTP,
     RPC_WSS: process.env.RPC_WSS,
     TG_BOT_TOKEN: process.env.TG_BOT_TOKEN,
@@ -215,12 +215,13 @@ class RaydiumLPBurnMonitor {
     async processLogs(logs, context, programId) {
         const signature = logs.signature;
         
-        // Check if already processed
+        // Check if already processed or queued
         if (this.detectedBurns.has(signature)) return;
         
         // Look for burn patterns
         if (this.detectBurnPattern(logs.logs)) {
-            logger.debug(`Potential burn detected in tx: ${signature}`);
+            const shortSig = signature.slice(0, 8);
+            logger.debug(`Potential burn detected in tx: ${shortSig}...`);
             
             // Queue for processing instead of immediate processing
             this.queueTransaction(signature, context.slot);
@@ -233,6 +234,7 @@ class RaydiumLPBurnMonitor {
     async processTokenLogs(logs, context) {
         const signature = logs.signature;
         
+        // Check if already processed or queued
         if (this.detectedBurns.has(signature)) return;
         
         const logMessages = logs.logs || [];
@@ -252,7 +254,8 @@ class RaydiumLPBurnMonitor {
                 message.includes('Instruction: BurnChecked') ||
                 this.containsBurnAddress(message)) {
                 
-                logger.debug(`LP Token burn detected in tx: ${signature}`);
+                const shortSig = signature.slice(0, 8);
+                logger.debug(`LP Token burn detected in tx: ${shortSig}...`);
                 
                 // Queue for processing instead of immediate processing
                 this.queueTransaction(signature, context.slot);
@@ -269,10 +272,16 @@ class RaydiumLPBurnMonitor {
             this.transactionQueue = [];
         }
         
+        // Check if already processed or in queue
+        if (this.detectedBurns.has(signature)) {
+            return;
+        }
+        
         // Add to queue if not already there
-        if (!this.transactionQueue.find(tx => tx.signature === signature)) {
+        const exists = this.transactionQueue.find(tx => tx.signature === signature);
+        if (!exists) {
             this.transactionQueue.push({ signature, slot, timestamp: Date.now() });
-            logger.debug(`Queued transaction: ${signature}`);
+            logger.info(`📥 Queued transaction: ${signature.slice(0, 8)}... (queue size: ${this.transactionQueue.length})`);
         }
     }
 
@@ -519,35 +528,96 @@ class RaydiumLPBurnMonitor {
      */
     async isLPToken(mintAddress, tx) {
         try {
-            // Check if mint is associated with a Raydium pool
-            // LP tokens usually have specific naming patterns or are created by Raydium
-            
             // Method 1: Check if the transaction involves pool operations
             if (tx?.meta?.logMessages) {
                 const hasPoolOps = tx.meta.logMessages.some(log => 
                     log && (
-                        log.includes('pool') || 
-                        log.includes('liquidity') ||
-                        log.includes('LP') ||
-                        log.includes('Raydium')
+                        log.toLowerCase().includes('pool') || 
+                        log.toLowerCase().includes('liquidity') ||
+                        log.toLowerCase().includes('lp') ||
+                        log.toLowerCase().includes('raydium') ||
+                        log.toLowerCase().includes('amm')
                     )
                 );
                 
                 if (hasPoolOps) return true;
             }
             
-            // Method 2: Check if this mint is in our LP token cache
+            // Method 2: Check if this is a BurnChecked instruction (LP tokens often use this)
+            if (tx?.meta?.logMessages) {
+                const hasBurnChecked = tx.meta.logMessages.some(log => 
+                    log && log.includes('Instruction: BurnChecked')
+                );
+                
+                if (hasBurnChecked) {
+                    // If BurnChecked is used with Raydium context, it's likely an LP token
+                    const hasRaydiumContext = tx.transaction?.message?.accountKeys?.some(key => {
+                        if (!key || !key.toBase58) return false;
+                        const keyStr = key.toBase58();
+                        return keyStr.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8') ||
+                               keyStr.includes('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK') ||
+                               keyStr.includes('CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C') ||
+                               keyStr.includes('5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1');
+                    });
+                    
+                    if (hasRaydiumContext) return true;
+                }
+            }
+            
+            // Method 3: Check mint address pattern
+            // Many LP tokens have specific patterns in their mint addresses
+            // or are created by Raydium's authority
+            
+            // Method 4: Check if this mint is in our LP token cache
             if (this.tokenCache.has(mintAddress)) {
                 return this.tokenCache.get(mintAddress).isLP;
             }
             
-            // Skip expensive RPC call to avoid rate limits
-            // We'll rely on transaction context instead
+            // Method 5: If it's a large burn (>90%) in a Raydium context, assume it's LP
+            // This is a heuristic but works well in practice
+            const burnPercentage = this.getCurrentBurnPercentage(tx);
+            if (burnPercentage > 0.9) {
+                return true; // High percentage burns are typically LP burns
+            }
             
             return false;
         } catch (error) {
             logger.debug(`Error checking LP token status: ${error.message}`);
             return false;
+        }
+    }
+    
+    /**
+     * Helper to get current burn percentage from transaction
+     */
+    getCurrentBurnPercentage(tx) {
+        try {
+            if (!tx?.meta?.preTokenBalances || !tx?.meta?.postTokenBalances) {
+                return 0;
+            }
+            
+            for (const pre of tx.meta.preTokenBalances) {
+                if (!pre || !pre.uiTokenAmount) continue;
+                
+                const post = tx.meta.postTokenBalances.find(p => 
+                    p && p.accountIndex === pre.accountIndex
+                );
+                
+                if (!post || !post.uiTokenAmount) continue;
+                
+                const preAmount = BigInt(pre.uiTokenAmount.amount || 0);
+                const postAmount = BigInt(post.uiTokenAmount.amount || 0);
+                
+                // Check for significant burn
+                if (preAmount > 0n && postAmount < preAmount) {
+                    const burnAmount = preAmount - postAmount;
+                    return Number(burnAmount) / Number(preAmount);
+                }
+            }
+            
+            return 0;
+        } catch (error) {
+            return 0;
         }
     }
 
@@ -637,9 +707,12 @@ class RaydiumLPBurnMonitor {
      * Handle valid LP burn
      */
     async handleValidBurn(signature, burnInfo, slot) {
+        const shortSig = signature.slice(0, 8);
+        const shortMint = burnInfo.tokenMint ? burnInfo.tokenMint.slice(0, 8) : 'Unknown';
+        
         logger.info(`🔥 VALID LP BURN DETECTED!`);
-        logger.info(`  Signature: ${signature}`);
-        logger.info(`  Token: ${burnInfo.tokenMint}`);
+        logger.info(`  Signature: ${shortSig}...`);
+        logger.info(`  Token: ${shortMint}...`);
         logger.info(`  Amount: ${burnInfo.burnAmount.toFixed(2)}`);
         logger.info(`  Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
         logger.info(`  SOL Value: ~${burnInfo.solValue.toFixed(3)} SOL`);
