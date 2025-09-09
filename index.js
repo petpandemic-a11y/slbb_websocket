@@ -314,10 +314,26 @@ class RaydiumLPBurnMonitor {
         if (!logs) return false;
         
         for (const log of logs) {
-            // Check for burn-related keywords
+            // SKIP swap transactions completely
+            if (log.toLowerCase().includes('swap') || 
+                log.toLowerCase().includes('jupiter') ||
+                log.toLowerCase().includes('aggregator')) {
+                return false; // This is a swap, not a burn
+            }
+            
+            // Check for real burn patterns
             if (log.toLowerCase().includes('burn') ||
                 log.toLowerCase().includes('remove liquidity') ||
-                this.containsBurnAddress(log)) {
+                log.includes('Instruction: BurnChecked') ||
+                log.includes('Instruction: Burn')) {
+                // Additional check: make sure it's not just a swap with burn in the name
+                if (!log.toLowerCase().includes('swap')) {
+                    return true;
+                }
+            }
+            
+            // Check for burn addresses
+            if (this.containsBurnAddress(log)) {
                 return true;
             }
         }
@@ -426,6 +442,37 @@ class RaydiumLPBurnMonitor {
                 return null;
             }
             
+            // IMPORTANT: Skip swap transactions
+            if (meta.logMessages) {
+                const isSwap = meta.logMessages.some(log => 
+                    log && (
+                        log.toLowerCase().includes('swap') ||
+                        log.toLowerCase().includes('jupiter') ||
+                        log.toLowerCase().includes('aggregator') ||
+                        log.toLowerCase().includes('route')
+                    )
+                );
+                
+                if (isSwap) {
+                    logger.debug('Skipping swap transaction');
+                    return null; // This is a swap, not a burn
+                }
+                
+                // Check for real burn instructions
+                const hasBurnInstruction = meta.logMessages.some(log =>
+                    log && (
+                        log.includes('Instruction: Burn') ||
+                        log.includes('Instruction: BurnChecked') ||
+                        log.includes('RemoveLiquidity')
+                    )
+                );
+                
+                if (!hasBurnInstruction) {
+                    logger.debug('No burn instruction found in transaction');
+                    return null;
+                }
+            }
+            
             const burnInfo = {
                 tokenMint: null,
                 burnAmount: 0,
@@ -528,29 +575,52 @@ class RaydiumLPBurnMonitor {
      */
     async isLPToken(mintAddress, tx) {
         try {
-            let hasBurnChecked = false;
-            let hasPoolOps = false;
-            
-            // Method 1: Check logs
+            // CRITICAL: Skip if this is a swap transaction
             if (tx?.meta?.logMessages) {
-                // Check for BurnChecked - strongest indicator
-                hasBurnChecked = tx.meta.logMessages.some(log => 
-                    log && log.includes('Instruction: BurnChecked')
+                const isSwap = tx.meta.logMessages.some(log => 
+                    log && (
+                        log.toLowerCase().includes('swap') ||
+                        log.toLowerCase().includes('jupiter') ||
+                        log.toLowerCase().includes('aggregator')
+                    )
+                );
+                
+                if (isSwap) {
+                    logger.debug('Not an LP token - this is a swap transaction');
+                    return false;
+                }
+                
+                // Check for BurnChecked - strongest indicator of LP burn
+                const hasBurnChecked = tx.meta.logMessages.some(log => 
+                    log && (
+                        log.includes('Instruction: BurnChecked') ||
+                        log.includes('Instruction: Burn')
+                    )
                 );
                 
                 if (hasBurnChecked) {
-                    logger.debug('LP Token identified: BurnChecked instruction');
-                    return true; // BurnChecked = almost certainly LP token
+                    // Additional check: must have Raydium context
+                    const hasRaydiumContext = tx.transaction?.message?.accountKeys?.some(key => {
+                        if (!key || !key.toBase58) return false;
+                        const keyStr = key.toBase58();
+                        return keyStr === '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8' ||
+                               keyStr === 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK' ||
+                               keyStr === 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
+                    });
+                    
+                    if (hasRaydiumContext) {
+                        logger.debug('LP Token identified: BurnChecked with Raydium');
+                        return true;
+                    }
                 }
                 
-                // Check for pool operations
-                hasPoolOps = tx.meta.logMessages.some(log => 
-                    log && (
-                        log.toLowerCase().includes('pool') || 
-                        log.toLowerCase().includes('liquidity') ||
-                        log.toLowerCase().includes('lp') ||
-                        log.toLowerCase().includes('raydium') ||
-                        log.toLowerCase().includes('amm')
+                // Check for pool/liquidity operations (but not swaps)
+                const hasPoolOps = tx.meta.logMessages.some(log => 
+                    log && !log.toLowerCase().includes('swap') && (
+                        log.toLowerCase().includes('remove liquidity') ||
+                        log.toLowerCase().includes('removeliquidity') ||
+                        log.toLowerCase().includes('lp token') ||
+                        log.toLowerCase().includes('liquidity pool')
                     )
                 );
                 
@@ -560,22 +630,7 @@ class RaydiumLPBurnMonitor {
                 }
             }
             
-            // Method 2: Check burn percentage
-            const burnPercentage = this.getCurrentBurnPercentage(tx);
-            
-            // 100% burns are almost always LP burns
-            if (burnPercentage === 1.0) {
-                logger.debug('LP Token identified: 100% burn');
-                return true;
-            }
-            
-            // High percentage burns (>90%) are likely LP
-            if (burnPercentage > 0.9) {
-                logger.debug('LP Token identified: High burn percentage');
-                return true;
-            }
-            
-            // Method 3: Check cache
+            // Check cache
             if (this.tokenCache.has(mintAddress)) {
                 return this.tokenCache.get(mintAddress).isLP;
             }
@@ -583,9 +638,7 @@ class RaydiumLPBurnMonitor {
             return false;
         } catch (error) {
             logger.debug(`Error checking LP token status: ${error.message}`);
-            // On error, if we have a high burn %, assume it's LP
-            const burnPercentage = this.getCurrentBurnPercentage(tx);
-            return burnPercentage > 0.9;
+            return false;
         }
     }
     
@@ -678,20 +731,7 @@ class RaydiumLPBurnMonitor {
         // Log every burn for debugging
         logger.info(`🔍 Validating burn: Token ${burnInfo.tokenMint?.slice(0, 8)}... Amount: ${burnInfo.burnAmount} Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}% IsLP: ${burnInfo.isLPToken}`);
         
-        // Temporarily relaxed validation for debugging
-        // Accept ANY high percentage burn
-        if (burnInfo.burnPercentage >= 0.90) {
-            logger.info(`✅ HIGH BURN DETECTED - Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
-            
-            // Force it to be treated as LP token if high burn
-            burnInfo.isLPToken = true;
-            
-            return true;
-        }
-        
-        // Original strict validation (commented out for now)
-        /*
-        // Only validate LP tokens
+        // Must be an LP token
         if (!burnInfo.isLPToken) {
             logger.debug(`Not an LP token burn: ${burnInfo.tokenMint}`);
             return false;
@@ -703,23 +743,14 @@ class RaydiumLPBurnMonitor {
             return false;
         }
         
-        // Check SOL value
-        if (burnInfo.solValue < config.MIN_SOL_BURN) {
+        // Check SOL value (optional)
+        if (config.MIN_SOL_BURN > 0 && burnInfo.solValue < config.MIN_SOL_BURN) {
             logger.debug(`SOL value too low: ${burnInfo.solValue} SOL`);
             return false;
         }
         
-        // Check token age (if we have creation time)
-        if (burnInfo.timestamp) {
-            const ageMinutes = (Date.now() / 1000 - burnInfo.timestamp) / 60;
-            if (ageMinutes < config.MIN_BURN_MINT_AGE_MIN) {
-                logger.debug(`Token too new: ${ageMinutes.toFixed(0)} minutes`);
-                return false;
-            }
-        }
-        */
-        
-        return false;
+        logger.info(`✅ VALID LP BURN - Percentage: ${(burnInfo.burnPercentage * 100).toFixed(2)}%`);
+        return true;
     }
 
     /**
