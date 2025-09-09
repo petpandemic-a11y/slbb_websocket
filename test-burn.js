@@ -162,15 +162,38 @@ async function analyzeBurn(tx) {
         isLPToken: false
     };
     
-    // Check for LP token characteristics
-    const hasPoolOps = tx.meta.logMessages?.some(log => 
-        log && (
-            log.includes('pool') || 
-            log.includes('liquidity') ||
-            log.includes('LP') ||
-            log.includes('Raydium')
-        )
-    );
+    // Enhanced LP token detection
+    let hasPoolOps = false;
+    let hasBurnChecked = false;
+    let hasRaydiumProgram = false;
+    
+    // Check logs
+    if (tx.meta.logMessages) {
+        hasPoolOps = tx.meta.logMessages.some(log => 
+            log && (
+                log.toLowerCase().includes('pool') || 
+                log.toLowerCase().includes('liquidity') ||
+                log.toLowerCase().includes('lp') ||
+                log.toLowerCase().includes('raydium') ||
+                log.toLowerCase().includes('amm')
+            )
+        );
+        
+        hasBurnChecked = tx.meta.logMessages.some(log => 
+            log && log.includes('Instruction: BurnChecked')
+        );
+    }
+    
+    // Check for Raydium programs
+    if (tx.transaction?.message?.accountKeys) {
+        hasRaydiumProgram = tx.transaction.message.accountKeys.some(key => {
+            const keyStr = key.toBase58();
+            return keyStr === '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8' ||
+                   keyStr === 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK' ||
+                   keyStr === 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C' ||
+                   keyStr === '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
+        });
+    }
     
     // Find burns
     for (let i = 0; i < tx.meta.preTokenBalances.length; i++) {
@@ -192,7 +215,11 @@ async function analyzeBurn(tx) {
             
             burnInfo.tokenMint = pre.mint;
             burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
-            burnInfo.isLPToken = hasPoolOps;
+            
+            // Enhanced LP token detection
+            burnInfo.isLPToken = hasPoolOps || 
+                                (hasBurnChecked && hasRaydiumProgram) ||
+                                (burnInfo.burnPercentage > 0.9 && hasRaydiumProgram);
             
             // Find sender
             const sender = tx.meta.preTokenBalances.find(b => 
@@ -209,6 +236,11 @@ async function analyzeBurn(tx) {
                 }
             }
             
+            // Re-check LP status with burn percentage
+            if (burnInfo.burnPercentage > 0.9) {
+                burnInfo.isLPToken = true;
+            }
+            
             return burnInfo;
         }
         
@@ -218,7 +250,11 @@ async function analyzeBurn(tx) {
             burnInfo.burnAmount = Number(preAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
             burnInfo.burner = pre.owner;
             burnInfo.burnPercentage = 1.0;
-            burnInfo.isLPToken = hasPoolOps;
+            
+            // Enhanced LP token detection for 100% burns
+            burnInfo.isLPToken = hasPoolOps || 
+                                (hasBurnChecked && hasRaydiumProgram) ||
+                                hasRaydiumProgram; // 100% burns with Raydium are likely LP
             
             return burnInfo;
         }
