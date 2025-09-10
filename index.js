@@ -51,6 +51,7 @@ const dbg = (...a)=>{ if (String(DEBUG)==='1') console.log('[debug]', ...a); };
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
 
 // ===== Program IDs (Raydium docs) =====
+// FIGYELEM: ezekkel dolgoztunk eddig a futó verzióban is.
 const RAYDIUM_AMM_V4_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 const RAYDIUM_CPMM_ID   = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
 const RAYDIUM_CLMM_ID   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
@@ -192,12 +193,23 @@ function hasRaydiumProgramInMessage(tx){
   }
   return false;
 }
-function looksLikeRemoveLiquidity(burns, increases){
-  const lpMints=new Set(burns.map(b=>b.mint));
-  const nonLpIncs=increases.filter(x=>!lpMints.has(x.mint) && x.amount>0);
-  const distinct=new Set(nonLpIncs.map(x=>x.mint));
-  return distinct.size >= 2;
+
+// >>> PATCH: remove-liquidity felismerés megerősítve (log + balansz) <<<
+function looksLikeRemoveLiquidity(burns, increases, logs) {
+  // 1) két különböző nem-LP mint nő
+  const lpMints = new Set(burns.map(b => b.mint));
+  const nonLpIncs = (increases || []).filter(x => !lpMints.has(x.mint) && x.amount > 0);
+  const distinct = new Set(nonLpIncs.map(x => x.mint));
+  if (distinct.size >= 2) return true;
+
+  // 2) log minták
+  const txt = (logs || []).join('\n');
+  if (/(remove[\s_-]*liquidity|removeliquidity|withdraw[\s_-]*liquidity|withdrawliquidity|burn\s+lp)/i.test(txt)) {
+    return true;
+  }
+  return false;
 }
+
 function maxBurnPct(burns){
   let maxPct=0;
   for(const b of burns){
@@ -235,8 +247,8 @@ async function evaluateAndNotify(sig, tx) {
   const burns=extractBurns(tx);
   const incs =extractIncreases(tx);
 
-  // 4) remove-liq minta
-  if (looksLikeRemoveLiquidity(burns, incs)){
+  // 4) remove-liq minta (PATCH: log + balansz alapú)
+  if (looksLikeRemoveLiquidity(burns, incs, logs)){
     console.log('[skip]', sig, 'remove_liq_pattern');
     return false;
   }
@@ -331,14 +343,17 @@ async function subscribe(){
         const ll = ev?.logs || [];
         const text = (Array.isArray(ll) ? ll.join('\n') : String(ll));
 
+        // Burn/BurnChecked kötelező?
         if (PREFILTER_BURN_ONLY && !(/Instruction:\s*BurnChecked|Instruction:\s*Burn/i.test(text))) {
-          pass = false; // nincs Burn/BurnChecked a WSS logban
+          pass = false;
         }
+        // Zaj
         if (pass && PREFILTER_SKIP_NOISE && /(swap|route|jupiter|aggregator|meteora|goonfi)/i.test(text)) {
-          pass = false; // zaj
+          pass = false;
         }
-        if (pass && /(remove\s*liquidity|removeliquidity|withdraw\s*liquidity)/i.test(text)) {
-          pass = false; // remove-liq minta
+        // >>> PATCH: remove-liq minták WSS-ben is
+        if (pass && /(remove[\s_-]*liquidity|removeliquidity|withdraw[\s_-]*liquidity|withdrawliquidity|burn\s+lp)/i.test(text)) {
+          pass = false;
         }
       }
 
@@ -361,9 +376,10 @@ async function subscribe(){
     const tx =await connection.getTransaction(sig,{maxSupportedTransactionVersion:0, commitment:'confirmed'});
     if (!tx){
       console.error('Teszt tx nem található');
+      // tesztmódban is küldünk TG pinget
+      await sendTG(`<b>Teszt mód</b> ❌<br/>Tx nem található: <code>${esc(sig)}</code>`);
       return;
     }
-    // Debug összefoglaló
     const logs=tx?.meta?.logMessages||[];
     console.log(
       'hasBurnChecked=', hasBurnChecked(logs),
@@ -371,15 +387,19 @@ async function subscribe(){
       'noise=', hasNoise(logs)
     );
     const burns=extractBurns(tx), incs=extractIncreases(tx);
-    console.log('looksRemoveLiq=', looksLikeRemoveLiquidity(burns,incs), 'maxBurnPct=', maxBurnPct(burns).toFixed(3));
+    console.log('looksRemoveLiq=', looksLikeRemoveLiquidity(burns,incs,logs), 'maxBurnPct=', maxBurnPct(burns).toFixed(3));
     const hit=await anyBurnMintHasKnownAuthority(burns);
     console.log('authorityHit=', hit.ok, hit.authority||'');
 
     const ok = await evaluateAndNotify(sig, tx);
-    console.log(ok ? '[test] ALERT sent' : '[test] not eligible');
+    await sendTG(ok
+      ? `<b>Teszt mód</b> ✅ Alert elküldve\n<code>${esc(sig)}</code>`
+      : `<b>Teszt mód</b> ⛔ Szűrő dobta\n<code>${esc(sig)}</code>`
+    );
     return;
   }
 
   console.log('LP Burn watcher starting… (STRICT_RAYDIUM_PROG=', REQUIRE_RAYDIUM ? 'ON' : 'OFF', ', WSS_PREFILTER=', PREFILTER ? 'ON' : 'OFF', ')');
   await subscribe();
 })();
+```0
