@@ -224,20 +224,27 @@ function connectWS(){
     logDbg('Feliratkozás elküldve Raydium programokra.');
   });
   ws.on('message', async (buf)=>{
-    let m; try{ m=JSON.parse(buf.toString()); } catch{ return; }
-    if (m.method==='transactionNotification'){
-      const tx = m?.params?.result?.transaction || m?.params?.result;
-      const sig = tx?.transaction?.signatures?.[0] || '';
-      // tanulás Raydium nyom alapján (ha engedélyezve)
-      await learnAuthoritiesFromTx(tx);
+  let m; try{ m=JSON.parse(buf.toString()); } catch{ return; }
+  if (m.method==='transactionNotification'){
+    const tx = m?.params?.result?.transaction || m?.params?.result;
+    const sig = tx?.transaction?.signatures?.[0] || '';
 
-      const check = await whyNotPureLPBurn(tx);
-      if(!check.ok){ console.log(`SKIP ${sig} reason=${check.reason}`); return; }
-      const text = buildMsg(tx, check);
-      await sendToTG(text);
-      console.log(`ALERT ${sig} reason=${check.reason} evidence=${check.raydiumEvidence}`);
+    // >>> ÚJ LOG A RENDER KONZOLRA <<<
+    console.log(`[INFO] Vizsgálom tx: ${sig}`);
+
+    await learnAuthoritiesFromTx(tx);
+
+    const check = await whyNotPureLPBurn(tx);
+    if(!check.ok){
+      console.log(`[SKIP] ${sig} → ${check.reason}`);
+      return;
     }
-  });
+
+    const text = buildMsg(tx, check);
+    await sendToTG(text);
+    console.log(`[ALERT] ${sig} ✅ evidence=${check.raydiumEvidence}`);
+  }
+});
   ws.on('close', (c,r)=>{ console.error('WebSocket closed:', c, r?.toString?.()||''); scheduleReconnect(); });
   ws.on('error', (e)=>{ console.error('WebSocket error:', e?.message||e); scheduleReconnect(); });
 }
