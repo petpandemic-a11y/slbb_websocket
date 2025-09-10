@@ -1,70 +1,63 @@
-// index.js — LP Burn watcher (onLogs + rate limiter + Telegram)
-
-// ENV példa (.env file):
-// RPC_HTTP=https://mainnet.helius-rpc.com/?api-key=...
-// RPC_WSS=wss://mainnet.helius-rpc.com/?api-key=...
-// TG_BOT_TOKEN=123456:ABC...
-// TG_CHAT_ID=-100123456
-// RATE_MS=1000
-// WATCH_RAYDIUM_AMM=1
-// WATCH_RAYDIUM_CPMM=1
-// WATCH_RAYDIUM_CLMM=0
-// WATCH_SPL_TOKEN_LEGACY=0
-// WATCH_SPL_TOKEN_2022=0
-// LOG_ALL_TX=0
-// AUTO_LEARN_AUTHORITIES=1
-// MIN_BURN_UI=0
+// index.js — Raydium LP Burn watcher (very-low-noise)
+// Feltételek riasztásra:
+// 1) BurnChecked a logokban
+// 2) Mint authority ∈ ismert Raydium authority-k (V4 alap + auto-learn opció)
+// 3) Tx-ben Raydium program (AMM v4 / CPMM / CLMM) jelen van
+// 4) Nincs swap/jupiter/route/meteora a logokban
+// 5) NINCS >=2 különböző nem-LP mint nettó növekedés (remove-liq kiszűrve)
+// 6) Burn arány >= MIN_LP_BURN_PCT (default 0.9)
+// 7) Beépített RATE_MS limiter queue-val
 
 import 'dotenv/config';
 import { Connection, PublicKey } from '@solana/web3.js';
 import fetch from 'node-fetch';
 import fs from 'fs';
 
-// ========= ENV =========
+// ============ ENV ============
 const {
   RPC_HTTP, RPC_WSS,
   TG_BOT_TOKEN, TG_CHAT_ID,
-  RATE_MS = '1000',
+  RATE_MS = '1200',                 // 1.2s default
+  MIN_BURN_UI = '0',                // min összes burn UI (nem kötelező)
+  MIN_LP_BURN_PCT = '0.9',          // min arány a számla PRE LP-egyenlegéhez
+  AUTO_LEARN_AUTHORITIES = '1',
+  LOG_ALL_TX = '0',
+  DEBUG = '0',
 
+  // Program watch kapcsolók
   WATCH_RAYDIUM_AMM = '1',
   WATCH_RAYDIUM_CPMM = '1',
   WATCH_RAYDIUM_CLMM = '0',
   WATCH_SPL_TOKEN_LEGACY = '0',
   WATCH_SPL_TOKEN_2022 = '0',
-
-  LOG_ALL_TX = '0',
-  AUTO_LEARN_AUTHORITIES = '1',
-  MIN_BURN_UI = '0',
-  DEBUG = '0'
 } = process.env;
 
 const dbg = (...a)=>{ if (String(DEBUG)==='1') console.log('[debug]', ...a); };
-const sleep = ms=> new Promise(r=>setTimeout(r, ms));
+const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
 
-// ========= Program IDs =========
-// Raydium
+// ============ Program IDs (Raydium docs alapján) ============
 const RAYDIUM_AMM_V4_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 const RAYDIUM_CPMM_ID   = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
-const RAYDIUM_CLMM_ID   = 'CAMMCzo5YL8w4VFF8KVHRk22GGUsp5VTaW7grrKgrWqK';
+const RAYDIUM_CLMM_ID   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
 
-// SPL Token programs
+// SPL Token programok
 const SPL_TOKEN_LEGACY_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const SPL_TOKEN_2022_ID   = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 
-// Raydium mint authority (pl. v4)
+// Ismert Raydium mint authority (V4)
 const RAYDIUM_AUTHORITY_V4 = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
 
-// ========= Connection =========
+// Zaj/aggregátor minták logból — ha bármelyik szerepel, SKIP
+const NOISE_KEYWORDS = ['swap', 'route', 'jupiter', 'aggregator', 'meteora', 'goonfi'];
+
+// ============ Connection ============
 const connection = new Connection(RPC_HTTP, {
   wsEndpoint: RPC_WSS,
-  commitment: 'confirmed'
+  commitment: 'confirmed',
 });
 
-// ========= Safe PublicKey =========
-function safePk(s) {
-  try { return new PublicKey(s.trim()); }
-  catch { console.error('⚠️ Invalid program id:', s); return null; }
-}
+// ============ Helpers ============
+function safePk(s){ try { return new PublicKey(String(s).trim()); } catch { console.error('⚠️ Invalid program id:', s); return null; } }
 
 function buildPrograms() {
   const list = [];
@@ -76,186 +69,301 @@ function buildPrograms() {
   return list.map(safePk).filter(Boolean);
 }
 
-// ========= Telegram =========
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-async function sendTG(html) {
+async function sendTG(html){
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+  try{
+    const r=await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`,{
       method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ chat_id: TG_CHAT_ID, text: html, parse_mode:'HTML', disable_web_page_preview:true })
     });
     if (!r.ok) console.error('Telegram error:', r.status, await r.text());
-  } catch(e){ console.error('Telegram send failed:', e.message); }
+  }catch(e){ console.error('Telegram send failed:', e.message); }
 }
 
-// ========= Burn extraction & authority =========
-function extractBurns(tx){
-  const burns=[];
-  try{
-    const pre=tx?.meta?.preTokenBalances||[];
-    const post=tx?.meta?.postTokenBalances||[];
-    const m=new Map(); for(const p of pre) m.set(p.accountIndex,p);
-    for(const q of post){
-      const p=m.get(q.accountIndex); if(!p) continue;
-      const dec=Number(q?.uiTokenAmount?.decimals ?? p?.uiTokenAmount?.decimals ?? 0);
-      const preAmt=Number(p?.uiTokenAmount?.amount||0);
-      const postAmt=Number(q?.uiTokenAmount?.amount||0);
-      if (postAmt<preAmt){
-        const delta=(preAmt-postAmt)/Math.pow(10,dec);
-        if (delta>0) burns.push({mint:q.mint,amount:delta});
+// ============ Burn & authority ============
+function extractBurns(tx) {
+  const burns = [];
+  try {
+    const pre = tx?.meta?.preTokenBalances || [];
+    const post= tx?.meta?.postTokenBalances || [];
+    const m = new Map(); for (const p of pre) m.set(p.accountIndex, p);
+    for (const q of post) {
+      const p = m.get(q.accountIndex); if (!p) continue;
+      const dec = Number(q?.uiTokenAmount?.decimals ?? p?.uiTokenAmount?.decimals ?? 0);
+      const preAmt  = Number(p?.uiTokenAmount?.amount || 0);
+      const postAmt = Number(q?.uiTokenAmount?.amount || 0);
+      if (postAmt < preAmt) {
+        const delta = (preAmt - postAmt) / Math.pow(10, dec);
+        if (delta > 0) burns.push({ mint: q.mint, amount: delta, preAmt, postAmt, decimals: dec, accountIndex: q.accountIndex });
       }
     }
-  }catch(e){ dbg('extractBurns err:', e.message); }
+  } catch(e){ dbg('extractBurns err:', e.message); }
   return burns;
 }
 
-const mintAuthCache=new Map();
-async function fetchMintAuthority(mint){
-  if(mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
+function extractIncreases(tx) {
+  // Nettó növekedések (nem LP) remove-liq kiszűréshez
+  const incs = [];
   try{
-    const body={jsonrpc:'2.0',id:'mint',method:'getAccountInfo',params:[mint,{encoding:'jsonParsed',commitment:'confirmed'}]};
-    const r=await fetch(RPC_HTTP,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-    const j=await r.json();
-    const auth=j?.result?.value?.data?.parsed?.info?.mintAuthority??null;
-    mintAuthCache.set(mint,{authority:auth,when:Date.now()});
-    return auth;
-  }catch(e){return null;}
+    const pre = tx?.meta?.preTokenBalances || [];
+    const post= tx?.meta?.postTokenBalances || [];
+    const m = new Map(); for (const p of pre) m.set(p.accountIndex, p);
+    for (const q of post) {
+      const p = m.get(q.accountIndex); if (!p) continue;
+      const dec = Number(q?.uiTokenAmount?.decimals ?? p?.uiTokenAmount?.decimals ?? 0);
+      const preAmt  = Number(p?.uiTokenAmount?.amount || 0);
+      const postAmt = Number(q?.uiTokenAmount?.amount || 0);
+      if (postAmt > preAmt) {
+        const delta = (postAmt - preAmt) / Math.pow(10, dec);
+        if (delta > 0) incs.push({ mint: q.mint, amount: delta, decimals: dec });
+      }
+    }
+  }catch(e){ dbg('extractIncreases err:', e.message); }
+  return incs;
 }
 
-// learned authorities
+const mintAuthCache = new Map();
+async function fetchMintAuthority(mint){
+  if (mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
+  try{
+    const body={jsonrpc:'2.0', id:'mint', method:'getAccountInfo', params:[mint,{encoding:'jsonParsed',commitment:'confirmed'}]};
+    const r=await fetch(RPC_HTTP,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    const auth=j?.result?.value?.data?.parsed?.info?.mintAuthority ?? null;
+    mintAuthCache.set(mint,{authority:auth,when:Date.now()});
+    return auth;
+  }catch(e){ return null; }
+}
+
+// Authority store
 const AUTH_FILE='./raydium_authorities.json';
 let learned=new Set([RAYDIUM_AUTHORITY_V4]);
 try{
-  if(fs.existsSync(AUTH_FILE)){
+  if (fs.existsSync(AUTH_FILE)) {
     const arr=JSON.parse(fs.readFileSync(AUTH_FILE,'utf8'));
-    if(Array.isArray(arr)) arr.forEach(a=>learned.add(a));
+    if (Array.isArray(arr)) arr.forEach(a=> learned.add(a));
   }
 }catch{}
 
-function persistLearned(){ try{fs.writeFileSync(AUTH_FILE,JSON.stringify([...learned],null,2));}catch{} }
+function persistLearned(){ try{ fs.writeFileSync(AUTH_FILE, JSON.stringify([...learned],null,2)); }catch{} }
 
 async function anyBurnMintHasKnownAuthority(burns){
   for(const b of burns){
     const a=await fetchMintAuthority(b.mint);
-    if(a&&learned.has(a)) return {ok:true,authority:a};
+    if (a && learned.has(a)) return { ok:true, authority:a, mint:b.mint };
   }
-  return {ok:false};
+  return { ok:false };
 }
 
 async function autoLearnFromTx(tx){
-  if(String(AUTO_LEARN_AUTHORITIES)!=='1') return;
+  if (String(AUTO_LEARN_AUTHORITIES)!=='1') return;
   const burns=extractBurns(tx);
   for(const b of burns){
     const a=await fetchMintAuthority(b.mint);
-    if(a&&!learned.has(a)){
+    if (a && !learned.has(a)) {
       learned.add(a); persistLearned();
-      console.log('[learned]',a,b.mint);
+      console.log('[learned]', a, 'mint', b.mint);
     }
   }
 }
 
-function sumBurnUi(burns){return burns.reduce((s,b)=>s+(Number.isFinite(b.amount)?b.amount:0),0);}
-
-async function checkPureLPBurn(tx){
-  const burns=extractBurns(tx);
-  if(burns.length===0) return {ok:false,reason:'no_lp'};
-  if(sumBurnUi(burns)<Number(MIN_BURN_UI||0)) return {ok:false,reason:'too_small'};
-  const hit=await anyBurnMintHasKnownAuthority(burns);
-  if(!hit.ok) return {ok:false,reason:'no_auth'};
-  return {ok:true,burns,evidence:'authority'};
+// ============ Log vizsgálat ============
+function hasBurnChecked(logs){
+  return (logs||[]).some(l => l?.includes('Instruction: BurnChecked') || l?.includes('Instruction: Burn'));
 }
-
-function formatAlert(tx,info){
-  const sig=tx?.transaction?.signatures?.[0]||'';
-  const byMint=new Map(); for(const b of info.burns) byMint.set(b.mint,(byMint.get(b.mint)||0)+b.amount);
-  let html=`<b>LP Burn Detected</b> ✅\n`;
-  if(sig) html+=`<b>Tx:</b> <code>${esc(sig)}</code>\n`;
-  html+=`<b>Evidence:</b> ${esc(info.evidence)}\n`;
-  for(const [mint,amt] of byMint.entries()){
-    html+=`<b>LP Mint:</b> <code>${esc(mint)}</code>\n<b>Burned:</b> ${amt>=1?amt.toLocaleString('en-US',{maximumFractionDigits:4}):amt.toExponential(4)}\n`;
+function hasNoise(logs){
+  const lower = (logs||[]).join('\n').toLowerCase();
+  return NOISE_KEYWORDS.some(k => lower.includes(k));
+}
+function hasRaydiumProgramInMessage(tx){
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const ids = [RAYDIUM_AMM_V4_ID, RAYDIUM_CPMM_ID, RAYDIUM_CLMM_ID];
+  for (const k of keys) {
+    const s = typeof k === 'string' ? k : k?.toBase58?.();
+    if (!s) continue;
+    if (ids.includes(s)) return true;
   }
-  if(sig) html+=`<a href="https://solscan.io/tx/${encodeURIComponent(sig)}">Solscan</a>`;
-  return html;
+  return false;
 }
 
-// ========= Queue + rate limiter =========
-const RATE=Math.max(100,parseInt(RATE_MS,10)||1000);
-const sigQueue=[];
-let busy=false; let lastSig='-';
+// Remove-liq detektálás:
+// ha van legalább KÉT különböző (LP minttől eltérő) mint, ahol nettó növekedés van ⇒ remove-liq gyanú.
+function looksLikeRemoveLiquidity(burns, increases){
+  const lpMints = new Set(burns.map(b=>b.mint));
+  const nonLpIncs = increases.filter(x => !lpMints.has(x.mint) && x.amount > 0);
+  const distinct = new Set(nonLpIncs.map(x=>x.mint));
+  return distinct.size >= 2; // két különböző mint nőtt → nagyon valószínű remove-liq
+}
 
-function enqueue(sig,prog){
-  if(String(LOG_ALL_TX)==='1') console.log('[rx]',sig,'via',prog);
-  sigQueue.push({sig,prog});
+// Burn arány a PRE LP-egyenleghez képest (max arány a talált LP accountokra)
+function maxBurnPct(burns){
+  let maxPct = 0;
+  for (const b of burns) {
+    if (b.preAmt > 0) {
+      const pct = (b.preAmt - b.postAmt) / b.preAmt;
+      if (pct > maxPct) maxPct = pct;
+    }
+  }
+  return maxPct;
+}
+
+// ============ Queue + limiter ============
+const RATE = Math.max(150, parseInt(RATE_MS,10) || 1200);
+const sigQueue = [];
+let busy = false;
+let lastSig = '-';
+
+function enqueue(sig, prog){
+  if (String(LOG_ALL_TX)==='1') console.log('[rx]', sig, 'via', prog);
+  sigQueue.push({ sig, prog });
   processQueue();
 }
-
 async function processQueue(){
-  if(busy||sigQueue.length===0) return;
-  busy=true;
-  const {sig,prog}=sigQueue.shift();
-  lastSig=sig;
-  console.log('[info] Processing:',sig,'via',prog,'queue=',sigQueue.length);
+  if (busy || sigQueue.length===0) return;
+  busy = true;
+
+  const { sig, prog } = sigQueue.shift();
+  lastSig = sig;
+  console.log('[info] Processing:', sig, 'via', prog, 'queue=', sigQueue.length);
+
   try{
-    const tx=await connection.getTransaction(sig,{maxSupportedTransactionVersion:0,commitment:'confirmed'});
-    if(!tx){
-      console.log('[skip] not_found',sig);
-    }else{
-      await autoLearnFromTx(tx);
-      const chk=await checkPureLPBurn(tx);
-      if(chk.ok){
-        await sendTG(formatAlert(tx,chk));
-        console.log('[ALERT]',sig);
-      }else{
-        console.log('[skip]',sig,'reason',chk.reason);
+    const tx = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment:'confirmed' });
+    if (!tx) {
+      console.log('[skip] not_found', sig);
+    } else {
+      const logs = tx?.meta?.logMessages || [];
+
+      // 1) legyen BurnChecked
+      if (!hasBurnChecked(logs)) {
+        dbg('no BurnChecked');
+        console.log('[skip]', sig, 'no_burnchecked');
+        return finish();
       }
+
+      // 2) Raydium program is legyen a message-ben
+      if (!hasRaydiumProgramInMessage(tx)) {
+        dbg('no raydium program in message');
+        console.log('[skip]', sig, 'no_raydium_program');
+        return finish();
+      }
+
+      // 3) no noise: swap/route/jupiter/meteora
+      if (hasNoise(logs)) {
+        dbg('noise keywords present');
+        console.log('[skip]', sig, 'noise_keywords');
+        return finish();
+      }
+
+      const burns = extractBurns(tx);
+      const incs  = extractIncreases(tx);
+
+      // 4) remove-liq szűrés: 2 különböző nem-LP mint nettó növekedett?
+      if (looksLikeRemoveLiquidity(burns, incs)) {
+        dbg('looks like remove-liq');
+        console.log('[skip]', sig, 'remove_liq_pattern');
+        return finish();
+      }
+
+      // 5) authority check (Raydium)
+      const hit = await anyBurnMintHasKnownAuthority(burns);
+      if (!hit.ok) {
+        dbg('no authority match');
+        console.log('[skip]', sig, 'no_authority_match');
+        return finish();
+      }
+
+      // 6) min összeg + arány ellenőrzés
+      const totalUi = burns.reduce((s,b)=>s+b.amount,0);
+      if (totalUi < Number(MIN_BURN_UI||0)) {
+        dbg('below MIN_BURN_UI');
+        console.log('[skip]', sig, 'too_small');
+        return finish();
+      }
+      const pct = maxBurnPct(burns);
+      if (pct < Number(MIN_LP_BURN_PCT||0.9)) {
+        dbg('below MIN_LP_BURN_PCT');
+        console.log('[skip]', sig, 'pct_too_low', pct.toFixed(3));
+        return finish();
+      }
+
+      // auto-learn (opcionális)
+      await autoLearnFromTx(tx);
+
+      // PASS — küldjük TG-re
+      const byMint = new Map(); for (const b of burns) byMint.set(b.mint, (byMint.get(b.mint)||0)+b.amount);
+      const sigShort = esc(sig);
+      let html = `<b>LP Burn Detected</b> ✅\n<b>Tx:</b> <code>${sigShort}</code>\n<b>Evidence:</b> authority + raydium + pct≥${Number(MIN_LP_BURN_PCT)}\n`;
+      for (const [mint, amt] of byMint.entries()) {
+        html += `<b>LP Mint:</b> <code>${esc(mint)}</code>\n<b>Burned:</b> ${amt>=1?amt.toLocaleString('en-US',{maximumFractionDigits:4}):amt.toExponential(4)}\n`;
+      }
+      html += `<a href="https://solscan.io/tx/${encodeURIComponent(sig)}">Solscan</a>`;
+      await sendTG(html);
+      console.log('[ALERT]', sig);
     }
-  }catch(e){
-    const m=String(e?.message||e);
-    console.error('[err] getTransaction',m);
-    if(m.includes('429')||m.toLowerCase().includes('too many requests')){
-      sigQueue.unshift({sig,prog});
-      await sleep(Math.min(RATE*3,6000));
+  } catch(e){
+    const m = String(e?.message||e);
+    console.error('[err] getTransaction', m);
+    if (m.includes('429') || m.toLowerCase().includes('too many requests')) {
+      sigQueue.unshift({ sig, prog });          // tegyük vissza előre
+      await sleep(Math.min(RATE*3, 6000));      // kis pihenő
     }
   }
-  await sleep(RATE);
-  busy=false;
-  if(sigQueue.length>0) processQueue();
+
+  finish();
+
+  function finish(){
+    setTimeout(()=>{ busy=false; if (sigQueue.length>0) processQueue(); }, RATE);
+  }
 }
 
-setInterval(()=>console.log(`[hb] queue=${sigQueue.length} lastSig=${lastSig}`),10000);
+setInterval(()=> console.log(`[hb] queue=${sigQueue.length} lastSig=${lastSig}`), 10000);
 
-// ========= Subscribe =========
+// ============ Subscribe ============
 async function subscribe(){
-  const progs=buildPrograms();
-  if(progs.length===0){ console.error('Nincs bekapcsolt program (ENV WATCH_*)'); process.exit(1); }
-  console.log('[info] Subscribing to:',progs.map(p=>p.toBase58()).join(', '),'| RATE_MS=',RATE);
-  for(const pk of progs){
-    try{
-      await connection.onLogs(pk,(logs)=>{
-        const sig=logs?.signature; if(!sig) return;
-        enqueue(sig,pk.toBase58().slice(0,6));
-      },'confirmed');
-      console.log('[ok] onLogs subscribed:',pk.toBase58());
-    }catch(e){
-      console.error('[err] subscribe fail',pk?.toBase58?.()||'?',e.message);
-    }
+  const programs = [];
+  if (String(WATCH_RAYDIUM_AMM)==='1')   programs.push(RAYDIUM_AMM_V4_ID);
+  if (String(WATCH_RAYDIUM_CPMM)==='1')  programs.push(RAYDIUM_CPMM_ID);
+  if (String(WATCH_RAYDIUM_CLMM)==='1')  programs.push(RAYDIUM_CLMM_ID);
+  if (String(WATCH_SPL_TOKEN_LEGACY)==='1') programs.push(SPL_TOKEN_LEGACY_ID);
+  if (String(WATCH_SPL_TOKEN_2022)==='1')   programs.push(SPL_TOKEN_2022_ID);
+
+  const pks = programs.map(safePk).filter(Boolean);
+  if (pks.length===0) {
+    console.error('Nincs bekapcsolt program (WATCH_*)');
+    process.exit(1);
+  }
+
+  console.log('[info] Subscribing onLogs to:', pks.map(p=>p.toBase58()).join(', '), '| RATE_MS=', parseInt(RATE_MS,10)||1200);
+  for (const pk of pks) {
+    await connection.onLogs(pk, (logs)=>{
+      const sig = logs?.signature;
+      if (!sig) return;
+      enqueue(sig, pk.toBase58().slice(0,6));
+    }, 'confirmed');
+    console.log('[ok] onLogs subscribed:', pk.toBase58());
   }
 }
 
-// ========= Main =========
+// ============ Main ============
 (async function main(){
-  if(!RPC_HTTP||!RPC_WSS){ console.error('Hiányzik RPC_HTTP vagy RPC_WSS'); process.exit(1); }
-  if(process.argv[2]){
-    const sig=process.argv[2];
-    const tx=await connection.getTransaction(sig,{maxSupportedTransactionVersion:0,commitment:'confirmed'});
-    if(!tx){ console.error('Teszt tx nem található'); return; }
-    await autoLearnFromTx(tx);
-    const chk=await checkPureLPBurn(tx);
-    console.log('TEST',sig,'ok=',chk.ok,'reason=',chk.reason);
-    if(chk.ok) await sendTG(formatAlert(tx,chk));
+  if (!RPC_HTTP || !RPC_WSS) {
+    console.error('Hiányzik RPC_HTTP vagy RPC_WSS az ENV-ben.');
+    process.exit(1);
+  }
+
+  if (process.argv[2]) {
+    const sig = process.argv[2];
+    const tx = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment:'confirmed' });
+    if (!tx) { console.error('Teszt tx nem található'); return; }
+    const logs = tx?.meta?.logMessages || [];
+    console.log('hasBurnChecked=', hasBurnChecked(logs), 'hasRaydiumProg=', hasRaydiumProgramInMessage(tx), 'noise=', hasNoise(logs));
+    const burns = extractBurns(tx); const incs = extractIncreases(tx);
+    console.log('looksRemoveLiq=', looksLikeRemoveLiquidity(burns, incs), 'maxBurnPct=', maxBurnPct(burns).toFixed(3));
+    const hit = await anyBurnMintHasKnownAuthority(burns); console.log('authorityHit=', hit.ok, hit.authority||'');
     return;
   }
-  console.log('LP Burn watcher starting…');
+
+  console.log('LP Burn watcher starting (ultra-low-noise)…');
   await subscribe();
 })();
