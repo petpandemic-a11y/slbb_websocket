@@ -1,13 +1,14 @@
-// index.js — Raydium LP Burn watcher (low-noise, WSS prefilter, TG notify)
-// Riasztás akkor megy TG-re, ha:
-// 1) BurnChecked a logban
-// 2) Raydium authority-t találunk a burn-ölt LP minthez
-// 3) (opcionális) Raydium program ID látszik a tx-ben — STRICT_RAYDIUM_PROG
-// 4) Nincs zaj (swap/route/jupiter/meteora stb.)
-// 5) Nem remove-liq minta
-// 6) Burn arány >= MIN_LP_BURN_PCT
+// index.js — Raydium LP Burn watcher (low-noise, erős remove-liq szűrés)
 //
-// Teszt mód: `node index.js <signature>` → ugyanaz a pipeline + TG.
+// TG értesítés CSAK akkor, ha:
+//  - BurnChecked a logban, ÉS
+//  - Raydium authority egyezés van a burn-ölt LP minthez, ÉS
+//  - (opcionális) Raydium program látszik a message-ben (STRICT_RAYDIUM_PROG=1), ÉS
+//  - NINCS zaj (swap/jupiter/meteora, stb.), ÉS
+//  - NEM remove-liquidity (többrétegű detektálás), ÉS
+//  - Burn arány >= MIN_LP_BURN_PCT
+//
+// Teszt: `node index.js <signature>` → ugyanaz a pipeline + TG ping.
 
 import 'dotenv/config';
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -26,55 +27,49 @@ const {
   LOG_ALL_TX = '0',
   DEBUG = '0',
 
-  // Program watch kapcsolók
   WATCH_RAYDIUM_AMM = '1',
   WATCH_RAYDIUM_CPMM = '1',
   WATCH_RAYDIUM_CLMM = '0',
   WATCH_SPL_TOKEN_LEGACY = '1',
   WATCH_SPL_TOKEN_2022 = '1',
 
-  // ha 1 → kötelező Raydium program a message-ben; ha 0 → authority elég
   STRICT_RAYDIUM_PROG = '0',
 
-  // WSS előszűrés
-  WSS_PREFILTER = '1',    // 1 = előszűrés bekapcsolva
-  WSS_BURN_ONLY = '1',    // 1 = csak akkor queue, ha Burn/BurnChecked látszik a WSS logban
-  WSS_SKIP_NOISE = '1',   // 1 = swap/jupiter/meteora stb. kiszűrése WSS-ben is
+  WSS_PREFILTER = '1',
+  WSS_BURN_ONLY = '1',
+  WSS_SKIP_NOISE = '1',
 } = process.env;
+
+const dbg = (...a)=>{ if (String(DEBUG)==='1') console.log('[debug]', ...a); };
+
+if (!RPC_HTTP || !RPC_WSS) {
+  console.error('Hiányzik RPC_HTTP vagy RPC_WSS az ENV-ben.');
+  process.exit(1);
+}
+
+const connection = new Connection(RPC_HTTP, { wsEndpoint: RPC_WSS, commitment: 'confirmed' });
 
 const REQUIRE_RAYDIUM = String(STRICT_RAYDIUM_PROG) !== '0';
 const PREFILTER = String(WSS_PREFILTER) === '1';
 const PREFILTER_BURN_ONLY = String(WSS_BURN_ONLY) !== '0';
 const PREFILTER_SKIP_NOISE = String(WSS_SKIP_NOISE) !== '0';
+const RATE = Math.max(150, parseInt(RATE_MS,10)||1200);
 
-const dbg = (...a)=>{ if (String(DEBUG)==='1') console.log('[debug]', ...a); };
-const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
+const NOISE_KEYWORDS = ['swap','route','jupiter','aggregator','meteora','goonfi'];
 
 // ===== Program IDs (Raydium docs) =====
-// FIGYELEM: ezekkel dolgoztunk eddig a futó verzióban is.
 const RAYDIUM_AMM_V4_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 const RAYDIUM_CPMM_ID   = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
 const RAYDIUM_CLMM_ID   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
 
-// SPL Token programok
 const SPL_TOKEN_LEGACY_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const SPL_TOKEN_2022_ID   = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 
-// Ismert Raydium mint authority (V4)
 const RAYDIUM_AUTHORITY_V4 = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
 
-// Zaj/aggregátor kulcsszavak
-const NOISE_KEYWORDS = ['swap', 'route', 'jupiter', 'aggregator', 'meteora', 'goonfi'];
-
-// ===== Connection =====
-if (!RPC_HTTP || !RPC_WSS) {
-  console.error('Hiányzik RPC_HTTP vagy RPC_WSS az ENV-ben.');
-  process.exit(1);
-}
-const connection = new Connection(RPC_HTTP, { wsEndpoint: RPC_WSS, commitment: 'confirmed' });
-
 // ===== Helpers =====
-function safePk(s){ try { return new PublicKey(String(s).trim()); } catch { console.error('⚠️ Invalid program id:', s); return null; } }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function safePk(s){ try{ return new PublicKey(String(s).trim()); }catch{ console.error('⚠️ Invalid program id:', s); return null; } }
 function buildPrograms(){
   const list=[];
   if (String(WATCH_RAYDIUM_AMM)==='1')      list.push(RAYDIUM_AMM_V4_ID);
@@ -85,6 +80,7 @@ function buildPrograms(){
   return list.map(safePk).filter(Boolean);
 }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
 async function sendTG(html){
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   try{
@@ -96,7 +92,7 @@ async function sendTG(html){
   }catch(e){ console.error('Telegram send failed:', e.message); }
 }
 
-// ===== Burn / authority =====
+// ===== Burn / balances =====
 function extractBurns(tx){
   const burns=[];
   try{
@@ -110,7 +106,7 @@ function extractBurns(tx){
       const postAmt = Number(q?.uiTokenAmount?.amount || 0);
       if (postAmt < preAmt) {
         const delta = (preAmt - postAmt) / Math.pow(10, dec);
-        if (delta>0) burns.push({ mint:q.mint, amount:delta, preAmt, postAmt, decimals:dec });
+        if (delta>0) burns.push({ mint:q.mint, amount:delta, preAmt, postAmt, decimals:dec, owner:q?.owner||p?.owner });
       }
     }
   }catch(e){ dbg('extractBurns err:', e.message); }
@@ -129,12 +125,29 @@ function extractIncreases(tx){
       const postAmt = Number(q?.uiTokenAmount?.amount || 0);
       if (postAmt > preAmt) {
         const delta = (postAmt - preAmt) / Math.pow(10, dec);
-        if (delta>0) incs.push({ mint:q.mint, amount:delta, decimals:dec });
+        if (delta>0) incs.push({ mint:q.mint, amount:delta, decimals:dec, owner:q?.owner });
       }
     }
   }catch(e){ dbg('extractIncreases err:', e.message); }
   return incs;
 }
+
+// signer lista (a message header alapján)
+function getSigners(tx){
+  try{
+    const msg = tx?.transaction?.message;
+    const n = msg?.header?.numRequiredSignatures || 0;
+    const keys = msg?.accountKeys || [];
+    const arr=[];
+    for (let i=0;i<n && i<keys.length;i++){
+      const s = typeof keys[i]==='string' ? keys[i] : keys[i]?.toBase58?.();
+      if (s) arr.push(s);
+    }
+    return new Set(arr);
+  }catch{ return new Set(); }
+}
+
+// authority cache
 const mintAuthCache=new Map();
 async function fetchMintAuthority(mint){
   if (mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
@@ -147,6 +160,7 @@ async function fetchMintAuthority(mint){
     return auth;
   }catch(e){ return null; }
 }
+
 const AUTH_FILE='./raydium_authorities.json';
 let learned=new Set([RAYDIUM_AUTHORITY_V4]);
 try{
@@ -156,6 +170,7 @@ try{
   }
 }catch{}
 function persistLearned(){ try{ fs.writeFileSync(AUTH_FILE, JSON.stringify([...learned],null,2)); }catch{} }
+
 async function anyBurnMintHasKnownAuthority(burns){
   for(const b of burns){
     const a=await fetchMintAuthority(b.mint);
@@ -163,6 +178,7 @@ async function anyBurnMintHasKnownAuthority(burns){
   }
   return { ok:false };
 }
+
 async function autoLearnFromTx(tx){
   if (String(AUTO_LEARN_AUTHORITIES)!=='1') return;
   const burns=extractBurns(tx);
@@ -194,19 +210,34 @@ function hasRaydiumProgramInMessage(tx){
   return false;
 }
 
-// >>> PATCH: remove-liquidity felismerés megerősítve (log + balansz) <<<
-function looksLikeRemoveLiquidity(burns, increases, logs) {
-  // 1) két különböző nem-LP mint nő
+// ——— LEGJOBB remove-liq detektálás: több feltétel együtt ———
+function looksLikeRemoveLiquidity(tx, burns, increases){
+  const logs = tx?.meta?.logMessages || [];
+
+  // A) log-alapú string minta
+  const txt = (logs || []).join('\n');
+  if (/(remove[\s_-]*liquidity|removeliquidity|withdraw[\s_-]*liquidity|withdrawliquidity|burn\s+lp)/i.test(txt)) {
+    return true;
+  }
+
+  // B) két különböző NEM-LP mint nő
   const lpMints = new Set(burns.map(b => b.mint));
   const nonLpIncs = (increases || []).filter(x => !lpMints.has(x.mint) && x.amount > 0);
   const distinct = new Set(nonLpIncs.map(x => x.mint));
   if (distinct.size >= 2) return true;
 
-  // 2) log minták
-  const txt = (logs || []).join('\n');
-  if (/(remove[\s_-]*liquidity|removeliquidity|withdraw[\s_-]*liquidity|withdrawliquidity|burn\s+lp)/i.test(txt)) {
-    return true;
+  // C) signer visszakap 1+ NEM-LP tokent, és Raydium authority benne van a msg-ben
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const hasRayAuthInMsg = keys.some(k=>{
+    const s = typeof k === 'string' ? k : k?.toBase58?.();
+    return s === RAYDIUM_AUTHORITY_V4;
+  });
+  if (hasRayAuthInMsg) {
+    const signers = getSigners(tx); // fee payer + társai
+    const toSigner = nonLpIncs.filter(x => x.owner && signers.has(x.owner));
+    if (toSigner.length >= 1) return true;
   }
+
   return false;
 }
 
@@ -221,24 +252,18 @@ function maxBurnPct(burns){
   return maxPct;
 }
 
-// ===== Közös értékelés + TG küldés (éles + teszt ugyanazt használja) =====
+// ===== Értékelés + TG =====
 async function evaluateAndNotify(sig, tx) {
   const logs = tx?.meta?.logMessages || [];
 
-  // 1) BurnChecked
   if (!hasBurnChecked(logs)){
     console.log('[skip]', sig, 'no_burnchecked');
     return false;
   }
-
-  // 2) (opcionális) Raydium program jelenlét
   if (REQUIRE_RAYDIUM && !hasRaydiumProgramInMessage(tx)){
-    dbg('no raydium program (strict mode)');
     console.log('[skip]', sig, 'no_raydium_program_strict');
     return false;
   }
-
-  // 3) zaj szűrés
   if (hasNoise(logs)){
     console.log('[skip]', sig, 'noise_keywords');
     return false;
@@ -247,20 +272,18 @@ async function evaluateAndNotify(sig, tx) {
   const burns=extractBurns(tx);
   const incs =extractIncreases(tx);
 
-  // 4) remove-liq minta (PATCH: log + balansz alapú)
-  if (looksLikeRemoveLiquidity(burns, incs, logs)){
+  // >>> Erős remove-liq védelem (A+B+C)
+  if (looksLikeRemoveLiquidity(tx, burns, incs)){
     console.log('[skip]', sig, 'remove_liq_pattern');
     return false;
   }
 
-  // 5) authority check
   const hit=await anyBurnMintHasKnownAuthority(burns);
   if (!hit.ok){
     console.log('[skip]', sig, 'no_authority_match');
     return false;
   }
 
-  // 6) min amount + pct
   const totalUi=burns.reduce((s,b)=>s+b.amount,0);
   if (totalUi < Number(MIN_BURN_UI||0)){
     console.log('[skip]', sig, 'too_small');
@@ -274,7 +297,6 @@ async function evaluateAndNotify(sig, tx) {
 
   await autoLearnFromTx(tx);
 
-  // OK → TG
   const byMint=new Map(); for(const b of burns) byMint.set(b.mint,(byMint.get(b.mint)||0)+b.amount);
   let html = `<b>LP Burn Detected</b> ✅\n<b>Tx:</b> <code>${esc(sig)}</code>\n<b>Evidence:</b> authority${REQUIRE_RAYDIUM?'+raydium':''}+pct≥${Number(MIN_LP_BURN_PCT)}\n`;
   for (const [mint,amt] of byMint.entries()){
@@ -286,8 +308,7 @@ async function evaluateAndNotify(sig, tx) {
   return true;
 }
 
-// ===== Queue + limiter =====
-const RATE=Math.max(150, parseInt(RATE_MS,10)||1200);
+// ===== Queue & limiter =====
 const sigQueue=[];
 let busy=false, lastSig='-';
 
@@ -308,7 +329,6 @@ async function processQueue(){
     const tx=await connection.getTransaction(sig,{maxSupportedTransactionVersion:0, commitment:'confirmed'});
     if (!tx){ console.log('[skip] not_found', sig); return finish(); }
 
-    // közös értékelés + TG
     await evaluateAndNotify(sig, tx);
 
   }catch(e){
@@ -327,7 +347,7 @@ async function processQueue(){
 }
 setInterval(()=> console.log(`[hb] queue=${sigQueue.length} lastSig=${lastSig}`), 10000);
 
-// ===== Subscribe (WSS előszűrés opcióval) =====
+// ===== Subscribe (WSS előszűrés) =====
 async function subscribe(){
   const pks=buildPrograms();
   if (pks.length===0){ console.error('Nincs bekapcsolt program (WATCH_*)'); process.exit(1); }
@@ -343,15 +363,13 @@ async function subscribe(){
         const ll = ev?.logs || [];
         const text = (Array.isArray(ll) ? ll.join('\n') : String(ll));
 
-        // Burn/BurnChecked kötelező?
         if (PREFILTER_BURN_ONLY && !(/Instruction:\s*BurnChecked|Instruction:\s*Burn/i.test(text))) {
           pass = false;
         }
-        // Zaj
         if (pass && PREFILTER_SKIP_NOISE && /(swap|route|jupiter|aggregator|meteora|goonfi)/i.test(text)) {
           pass = false;
         }
-        // >>> PATCH: remove-liq minták WSS-ben is
+        // >>> WSS szintű remove-liq minták (nagyon agresszív)
         if (pass && /(remove[\s_-]*liquidity|removeliquidity|withdraw[\s_-]*liquidity|withdrawliquidity|burn\s+lp)/i.test(text)) {
           pass = false;
         }
@@ -370,14 +388,12 @@ async function subscribe(){
 
 // ===== Main =====
 (async function main(){
-  // --- TESZT MÓD: node index.js <signature>  → pipeline + TG ---
+  // TESZT mód
   if (process.argv[2]) {
     const sig=process.argv[2];
     const tx =await connection.getTransaction(sig,{maxSupportedTransactionVersion:0, commitment:'confirmed'});
     if (!tx){
-      console.error('Teszt tx nem található');
-      // tesztmódban is küldünk TG pinget
-      await sendTG(`<b>Teszt mód</b> ❌<br/>Tx nem található: <code>${esc(sig)}</code>`);
+      await sendTG(`<b>Teszt mód</b> ❌ Tx nem található: <code>${esc(sig)}</code>`);
       return;
     }
     const logs=tx?.meta?.logMessages||[];
@@ -387,7 +403,7 @@ async function subscribe(){
       'noise=', hasNoise(logs)
     );
     const burns=extractBurns(tx), incs=extractIncreases(tx);
-    console.log('looksRemoveLiq=', looksLikeRemoveLiquidity(burns,incs,logs), 'maxBurnPct=', maxBurnPct(burns).toFixed(3));
+    console.log('looksRemoveLiq=', looksLikeRemoveLiquidity(tx,burns,incs), 'maxBurnPct=', maxBurnPct(burns).toFixed(3));
     const hit=await anyBurnMintHasKnownAuthority(burns);
     console.log('authorityHit=', hit.ok, hit.authority||'');
 
