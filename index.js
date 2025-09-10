@@ -1,4 +1,4 @@
-// index.js — Raydium LP burn watcher (Helius WS) + Test mode
+// index.js — Raydium LP burn watcher (Helius WS) + Test mode + REASON logging
 import 'dotenv/config';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
@@ -10,11 +10,10 @@ const {
   RPC_HTTP,                // pl: https://mainnet.helius-rpc.com/?api-key=...
   TG_BOT_TOKEN,
   TG_CHAT_ID,
-
-  // opcionálisak (env-ből jönnek, nem muszáj használni őket):
-  MIN_LP_BURN_PCT,         // nem használjuk szigorúan, de marad a kompat miatt
-  MIN_SOL_BURN,            // -||-
-  MAX_VAULT_OUTFLOW,       // -||-
+  // további env-eket is olvas, de nem feltétlen használja szigorúan:
+  MIN_LP_BURN_PCT,
+  MIN_SOL_BURN,
+  MAX_VAULT_OUTFLOW,
 } = process.env;
 
 // --- Konstansok / beállítások ---
@@ -24,11 +23,9 @@ const RAYDIUM_PROGRAM_IDS = [
 ];
 
 const INCINERATOR = '1nc1nerator11111111111111111111111111111111';
-
-// minden remove-liquidity jelleg: skip
 const SKIP_KEYWORDS = ['remove', 'remove_liquidity', 'withdraw', 'remove-liquidity'];
 
-const log = (...a) => { if (String(DEBUG) === '1') console.log('[DBG]', ...a); };
+const logDbg = (...a) => { if (String(DEBUG) === '1') console.log('[DBG]', ...a); };
 const wsUrl = RPC_WSS || (HELIUS_API_KEY ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : null);
 const httpUrl = RPC_HTTP || (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : null);
 
@@ -85,56 +82,70 @@ function extractBurns(tx) {
     for (const q of post) {
       const p = byIdx.get(q.accountIndex);
       if (!p) continue;
-      const dec = Number(q?.uiTokenAmount?.decimals || p?.uiTokenAmount?.decimals || 0);
+      const dec = Number(q?.uiTokenAmount?.decimals ?? p?.uiTokenAmount?.decimals ?? 0);
       const preAmt = Number(p?.uiTokenAmount?.amount || 0);
       const postAmt = Number(q?.uiTokenAmount?.amount || 0);
       if (postAmt < preAmt) {
         const delta = (preAmt - postAmt) / Math.pow(10, dec);
         if (delta > 0) {
-          burns.push({
-            mint: q.mint,
-            amount: delta,
-          });
+          burns.push({ mint: q.mint, amount: delta });
         }
       }
     }
   } catch (e) {
-    log('extractBurns error:', e.message);
+    logDbg('extractBurns error:', e.message);
   }
   return burns;
 }
 
-function looksLikePureLPBurn(tx) {
-  // Szigor:
-  // 1) Raydium program jelen van
-  // 2) NINCS remove-liquidity jellegű kulcsszó
-  // 3) Van tényleges token-csökkenés (burn-szerű)
-  if (!includesRaydium(tx)) return false;
-  if (hasRemoveHints(tx)) return false;
-  const burns = extractBurns(tx);
-  if (burns.length === 0) return false;
-
-  // Plusz óvatosság: ha két külön mint nagyot NŐ ugyanebben a tx-ben és nincs incinerator, az remove-ra utal
+function analyzeUnderlyingMovements(tx) {
+  // Összeadjuk mintenként a nettó változást (post - pre), decimallal skálázva
   try {
     const pre = tx?.meta?.preTokenBalances || [];
     const post = tx?.meta?.postTokenBalances || [];
-    const agg = {};
     const idx = {};
     for (const p of pre) idx[`${p.mint}|${p.owner || ''}|${p.accountIndex}`] = p;
+
+    const agg = {};
     for (const q of post) {
       const key = `${q.mint}|${q.owner || ''}|${q.accountIndex}`;
       const p = idx[key];
       if (!p) continue;
-      const dec = Number(q?.uiTokenAmount?.decimals || p?.uiTokenAmount?.decimals || 0);
+      const dec = Number(q?.uiTokenAmount?.decimals ?? p?.uiTokenAmount?.decimals ?? 0);
       const diff = (Number(q?.uiTokenAmount?.amount || 0) - Number(p?.uiTokenAmount?.amount || 0)) / Math.pow(10, dec);
       agg[q.mint] = (agg[q.mint] || 0) + diff;
     }
-    const bigUps = Object.values(agg).filter(v => v > 0).length;
+    return agg; // { mint: netChange }
+  } catch (e) {
+    logDbg('analyzeUnderlyingMovements error:', e.message);
+    return {};
+  }
+}
+
+function whyNotPureLPBurn(tx) {
+  // Visszaad: { ok: boolean, reason: string, burns?:[], details?:{} }
+  // Szigor:
+  // 1) Raydium program jelen van
+  if (!includesRaydium(tx)) return { ok: false, reason: 'no_raydium' };
+
+  // 2) Remove-liquidity jellegű kulcsszó nincs
+  if (hasRemoveHints(tx)) return { ok: false, reason: 'remove_hint' };
+
+  // 3) Van LP-szerű token csökkenés (burn-szerű)
+  const burns = extractBurns(tx);
+  if (burns.length === 0) return { ok: false, reason: 'no_lp_delta' };
+
+  // 4) Ha két külön underlying mint nagy nettó növekménye van és nincs incinerator, inkább remove
+  try {
+    const agg = analyzeUnderlyingMovements(tx);
     const viaIncin = JSON.stringify(tx).includes(INCINERATOR);
-    if (bigUps >= 2 && !viaIncin) return false; // inkább remove → skip
+    const bigUps = Object.values(agg).filter(v => v > 0).length;
+    if (bigUps >= 2 && !viaIncin) {
+      return { ok: false, reason: 'double_underlying_no_incin', details: { bigUps } };
+    }
   } catch {}
 
-  return true;
+  return { ok: true, reason: 'ok', burns };
 }
 
 function fmtNum(x) {
@@ -143,11 +154,11 @@ function fmtNum(x) {
   return x.toExponential(4);
 }
 
-function buildMsg(tx) {
+function buildMsg(tx, reasonInfo) {
   const sig = tx?.transaction?.signatures?.[0] || tx?.transaction?.signature || tx?.signature || '';
   const slot = tx?.slot ?? '';
   const time = tx?.blockTime ? new Date(tx.blockTime * 1000).toISOString().replace('T',' ').replace('Z','') : '';
-  const burns = extractBurns(tx);
+  const burns = reasonInfo?.burns ?? extractBurns(tx);
 
   let out = `*LP Burn Detected* ✅\n`;
   if (sig) out += `*Tx:* \`${sig}\`\n`;
@@ -180,7 +191,7 @@ function connectWS() {
   }
   ws = new WebSocket(wsUrl);
   ws.on('open', () => {
-    log('WebSocket opened:', wsUrl);
+    logDbg('WebSocket opened:', wsUrl);
     const sub = {
       jsonrpc: '2.0',
       id: 1,
@@ -191,7 +202,7 @@ function connectWS() {
       }]
     };
     ws.send(JSON.stringify(sub));
-    log('Feliratkozás elküldve Raydium programokra.');
+    logDbg('Feliratkozás elküldve Raydium programokra.');
   });
 
   ws.on('message', async (buf) => {
@@ -199,17 +210,19 @@ function connectWS() {
     try { m = JSON.parse(buf.toString()); } catch { return; }
     if (m.method === 'transactionNotification') {
       const tx = m?.params?.result?.transaction || m?.params?.result;
-      if (hasRemoveHints(tx)) {
-        log('SKIP remove-hint:', tx?.transaction?.signatures?.[0] || '');
+
+      const sig = tx?.transaction?.signatures?.[0] || '';
+      const check = whyNotPureLPBurn(tx);
+
+      if (!check.ok) {
+        console.log(`SKIP ${sig} reason=${check.reason}`);
         return;
       }
-      if (looksLikePureLPBurn(tx)) {
-        const text = buildMsg(tx);
-        await sendToTG(text);
-        log('TG sent for:', tx?.transaction?.signatures?.[0] || '');
-      } else {
-        log('SKIP (not pure LP burn):', tx?.transaction?.signatures?.[0] || '');
-      }
+
+      // ok → TG
+      const text = buildMsg(tx, check);
+      await sendToTG(text);
+      console.log(`ALERT ${sig} reason=${check.reason}`);
     }
   });
 
@@ -256,16 +269,12 @@ async function testSignature(sig) {
       console.error(j);
       return;
     }
-    const sigFound = tx?.transaction?.signatures?.[0] || sig;
-    console.log('Tesztelt signature:', sigFound);
-    const isLPBurn = looksLikePureLPBurn(tx);
-    console.log('looksLikePureLPBurn:', isLPBurn);
-    if (isLPBurn) {
-      const text = buildMsg(tx);
+    const check = whyNotPureLPBurn(tx);
+    console.log(`TEST ${sig} looksLikePureLPBurn=${check.ok} reason=${check.reason}`);
+    if (check.ok) {
+      const text = buildMsg(tx, check);
       await sendToTG(text);
       console.log('Teszt üzenet elküldve TG-re.');
-    } else {
-      console.log('Teszt: SKIP (nem tiszta LP burn).');
     }
   } catch (e) {
     console.error('Teszt hiba:', e.message);
@@ -276,7 +285,6 @@ async function testSignature(sig) {
 (async function main() {
   console.log('LP Burn watcher starting…');
   if (process.argv[2]) {
-    // teszt mód egy konkrét tx-re
     await testSignature(process.argv[2]);
   } else {
     connectWS();
