@@ -1,4 +1,4 @@
-// index.js — Raydium LP burn watcher (Helius WS) + Test mode + REASON logging
+// index.js — Raydium LP burn watcher (Helius WS) + Test mode + REASON logging + Raydium Authority mint check
 import 'dotenv/config';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
@@ -10,17 +10,21 @@ const {
   RPC_HTTP,                // pl: https://mainnet.helius-rpc.com/?api-key=...
   TG_BOT_TOKEN,
   TG_CHAT_ID,
-  // további env-eket is olvas, de nem feltétlen használja szigorúan:
-  MIN_LP_BURN_PCT,
-  MIN_SOL_BURN,
-  MAX_VAULT_OUTFLOW,
+  // opcionális — vesszővel elválasztott Raydium Authority címek (mintAuthority-k)
+  // pl.: RAYDIUM_AUTHORITIES=5L5o...xyz,7qUk...abc
+  RAYDIUM_AUTHORITIES = ''
 } = process.env;
 
 // --- Konstansok / beállítások ---
+// Raydium AMM/CPMM programok (ha a tx-ben ezek nincsenek, még átmehet authority alapján)
 const RAYDIUM_PROGRAM_IDS = [
   'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C',
   'CAMMCzo5YL8w4VFF8KVHRk22GGUsp5VTaW7girrKgIrwQk',
 ];
+
+const RAYDIUM_AUTH_SET = new Set(
+  RAYDIUM_AUTHORITIES.split(',').map(s => s.trim()).filter(Boolean)
+);
 
 const INCINERATOR = '1nc1nerator11111111111111111111111111111111';
 const SKIP_KEYWORDS = ['remove', 'remove_liquidity', 'withdraw', 'remove-liquidity'];
@@ -52,7 +56,7 @@ async function sendToTG(text) {
   }
 }
 
-// --- Segédfüggvények ---
+// --- Segédfüggvények (Raydium program/LP-burn) ---
 function hasRemoveHints(obj) {
   try {
     const s = JSON.stringify(obj).toLowerCase();
@@ -72,7 +76,7 @@ function includesRaydium(tx) {
 }
 
 function extractBurns(tx) {
-  // Best-effort: összevetjük pre/post token egyenlegeket
+  // Best-effort: pre/post token egyenlegek differenciája
   const burns = [];
   try {
     const pre = tx?.meta?.preTokenBalances || [];
@@ -99,7 +103,7 @@ function extractBurns(tx) {
 }
 
 function analyzeUnderlyingMovements(tx) {
-  // Összeadjuk mintenként a nettó változást (post - pre), decimallal skálázva
+  // Mintenkénti nettó változás (post - pre), decimallal skálázva
   try {
     const pre = tx?.meta?.preTokenBalances || [];
     const post = tx?.meta?.postTokenBalances || [];
@@ -122,20 +126,62 @@ function analyzeUnderlyingMovements(tx) {
   }
 }
 
-function whyNotPureLPBurn(tx) {
-  // Visszaad: { ok: boolean, reason: string, burns?:[], details?:{} }
-  // Szigor:
-  // 1) Raydium program jelen van
-  if (!includesRaydium(tx)) return { ok: false, reason: 'no_raydium' };
+// --- Mint authority lekérdezés/cache ---
+const mintAuthCache = new Map(); // mint -> { authority: string|null, when: number }
 
-  // 2) Remove-liquidity jellegű kulcsszó nincs
+async function fetchMintAuthority(mint) {
+  if (!httpUrl) return null;
+  if (mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
+
+  try {
+    const body = {
+      jsonrpc: '2.0',
+      id: 'mintinfo',
+      method: 'getAccountInfo',
+      params: [mint, { encoding: 'jsonParsed', commitment: 'confirmed' }]
+    };
+    const res = await fetch(httpUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const j = await res.json();
+    const authority = j?.result?.value?.data?.parsed?.info?.mintAuthority ?? null;
+    mintAuthCache.set(mint, { authority, when: Date.now() });
+    logDbg('mintAuthority', mint, '→', authority);
+    return authority;
+  } catch (e) {
+    logDbg('fetchMintAuthority err:', e.message);
+    return null;
+  }
+}
+
+async function anyBurnMintHasRaydiumAuthority(burns) {
+  for (const b of burns) {
+    const auth = await fetchMintAuthority(b.mint);
+    if (auth && RAYDIUM_AUTH_SET.has(auth)) return { ok: true, authority: auth };
+  }
+  return { ok: false };
+}
+
+// --- Döntés: miért (nem) tiszta LP burn ---
+async function whyNotPureLPBurn(tx) {
+  // 1) Remove-liquidity jelleg
   if (hasRemoveHints(tx)) return { ok: false, reason: 'remove_hint' };
 
-  // 3) Van LP-szerű token csökkenés (burn-szerű)
+  // 2) Van LP-szerű token csökkenés?
   const burns = extractBurns(tx);
   if (burns.length === 0) return { ok: false, reason: 'no_lp_delta' };
 
-  // 4) Ha két külön underlying mint nagy nettó növekménye van és nincs incinerator, inkább remove
+  // 3) Raydium nyom: (A) Raydium program-ID a tx-ben VAGY (B) a burnölt mint(ek) authority-je Raydium
+  let raydiumEvidence = includesRaydium(tx) ? 'program' : '';
+  if (!raydiumEvidence && RAYDIUM_AUTH_SET.size > 0 && httpUrl) {
+    const authHit = await anyBurnMintHasRaydiumAuthority(burns);
+    if (authHit.ok) raydiumEvidence = 'authority';
+  }
+  if (!raydiumEvidence) return { ok: false, reason: 'no_raydium_and_no_authority_match' };
+
+  // 4) Remove ellenőrzés: ha két underlying nettó nő és nincs incinerator → inkább remove
   try {
     const agg = analyzeUnderlyingMovements(tx);
     const viaIncin = JSON.stringify(tx).includes(INCINERATOR);
@@ -145,7 +191,7 @@ function whyNotPureLPBurn(tx) {
     }
   } catch {}
 
-  return { ok: true, reason: 'ok', burns };
+  return { ok: true, reason: 'ok', burns, raydiumEvidence };
 }
 
 function fmtNum(x) {
@@ -164,6 +210,9 @@ function buildMsg(tx, reasonInfo) {
   if (sig) out += `*Tx:* \`${sig}\`\n`;
   if (time) out += `*Time:* ${time}\n`;
   if (slot) out += `*Slot:* ${slot}\n`;
+  if (reasonInfo?.raydiumEvidence) {
+    out += `*Raydium evidence:* ${reasonInfo.raydiumEvidence}\n`;
+  }
 
   const byMint = new Map();
   for (const b of burns) {
@@ -210,19 +259,19 @@ function connectWS() {
     try { m = JSON.parse(buf.toString()); } catch { return; }
     if (m.method === 'transactionNotification') {
       const tx = m?.params?.result?.transaction || m?.params?.result;
-
       const sig = tx?.transaction?.signatures?.[0] || '';
-      const check = whyNotPureLPBurn(tx);
+
+      const check = await whyNotPureLPBurn(tx);
 
       if (!check.ok) {
         console.log(`SKIP ${sig} reason=${check.reason}`);
         return;
       }
 
-      // ok → TG
+      // OK → TG
       const text = buildMsg(tx, check);
       await sendToTG(text);
-      console.log(`ALERT ${sig} reason=${check.reason}`);
+      console.log(`ALERT ${sig} reason=${check.reason} evidence=${check.raydiumEvidence || 'program'}`);
     }
   });
 
@@ -245,6 +294,7 @@ function scheduleReconnect() {
 }
 
 // --- Teszt mód: node index.js <signature> ---
+// Kiírja a mintAuthority-ket is, hogy fel tudd venni az .env-be
 async function testSignature(sig) {
   if (!httpUrl) {
     console.error('Hiányzik RPC_HTTP (vagy HELIUS_API_KEY). Állítsd be az .env-ben.');
@@ -269,8 +319,15 @@ async function testSignature(sig) {
       console.error(j);
       return;
     }
-    const check = whyNotPureLPBurn(tx);
-    console.log(`TEST ${sig} looksLikePureLPBurn=${check.ok} reason=${check.reason}`);
+    const burns = extractBurns(tx);
+    if (burns.length) {
+      for (const b of burns) {
+        const auth = await fetchMintAuthority(b.mint);
+        console.log(`mint=${b.mint} mintAuthority=${auth || 'null'}`);
+      }
+    }
+    const check = await whyNotPureLPBurn(tx);
+    console.log(`TEST ${sig} looksLikePureLPBurn=${check.ok} reason=${check.reason} evidence=${check.raydiumEvidence || ''}`);
     if (check.ok) {
       const text = buildMsg(tx, check);
       await sendToTG(text);
