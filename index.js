@@ -1,14 +1,13 @@
-// index.js — Raydium LP Burn watcher (ultra-low-noise + STRICT_RAYDIUM_PROG)
-// Teszt mód (node index.js <signature>) is végigfut a teljes szűrésen és posztol TG-re.
+// index.js — Raydium LP Burn watcher (low-noise, WSS prefilter, TG notify)
+// Riasztás akkor megy TG-re, ha:
+// 1) BurnChecked a logban
+// 2) Raydium authority-t találunk a burn-ölt LP minthez
+// 3) (opcionális) Raydium program ID látszik a tx-ben — STRICT_RAYDIUM_PROG
+// 4) Nincs zaj (swap/route/jupiter/meteora stb.)
+// 5) Nem remove-liq minta
+// 6) Burn arány >= MIN_LP_BURN_PCT
 //
-// Riasztás csak akkor:
-// 1) BurnChecked a logokban
-// 2) Raydium authority a burn-ölt minthez
-// 3) (opcionális) Raydium program jelen van a tx-ben — STRICT_RAYDIUM_PROG
-// 4) Nincs zaj: swap/route/jupiter/meteora stb.
-// 5) Nem remove-liq (>=2 nem-LP mint nettó növekedés)
-// 6) Burn arány >= MIN_LP_BURN_PCT (default: 0.9)
-// 7) Rate limiter queue-val (RATE_MS)
+// Teszt mód: `node index.js <signature>` → ugyanaz a pipeline + TG.
 
 import 'dotenv/config';
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -31,14 +30,23 @@ const {
   WATCH_RAYDIUM_AMM = '1',
   WATCH_RAYDIUM_CPMM = '1',
   WATCH_RAYDIUM_CLMM = '0',
-  WATCH_SPL_TOKEN_LEGACY = '0',
-  WATCH_SPL_TOKEN_2022 = '0',
+  WATCH_SPL_TOKEN_LEGACY = '1',
+  WATCH_SPL_TOKEN_2022 = '1',
 
   // ha 1 → kötelező Raydium program a message-ben; ha 0 → authority elég
-  STRICT_RAYDIUM_PROG = '1',
+  STRICT_RAYDIUM_PROG = '0',
+
+  // WSS előszűrés
+  WSS_PREFILTER = '1',    // 1 = előszűrés bekapcsolva
+  WSS_BURN_ONLY = '1',    // 1 = csak akkor queue, ha Burn/BurnChecked látszik a WSS logban
+  WSS_SKIP_NOISE = '1',   // 1 = swap/jupiter/meteora stb. kiszűrése WSS-ben is
 } = process.env;
 
 const REQUIRE_RAYDIUM = String(STRICT_RAYDIUM_PROG) !== '0';
+const PREFILTER = String(WSS_PREFILTER) === '1';
+const PREFILTER_BURN_ONLY = String(WSS_BURN_ONLY) !== '0';
+const PREFILTER_SKIP_NOISE = String(WSS_SKIP_NOISE) !== '0';
+
 const dbg = (...a)=>{ if (String(DEBUG)==='1') console.log('[debug]', ...a); };
 const sleep = (ms)=> new Promise(r=>setTimeout(r, ms));
 
@@ -54,7 +62,7 @@ const SPL_TOKEN_2022_ID   = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 // Ismert Raydium mint authority (V4)
 const RAYDIUM_AUTHORITY_V4 = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
 
-// Zaj/aggregátor kulcsszavak (logban)
+// Zaj/aggregátor kulcsszavak
 const NOISE_KEYWORDS = ['swap', 'route', 'jupiter', 'aggregator', 'meteora', 'goonfi'];
 
 // ===== Connection =====
@@ -68,9 +76,9 @@ const connection = new Connection(RPC_HTTP, { wsEndpoint: RPC_WSS, commitment: '
 function safePk(s){ try { return new PublicKey(String(s).trim()); } catch { console.error('⚠️ Invalid program id:', s); return null; } }
 function buildPrograms(){
   const list=[];
-  if (String(WATCH_RAYDIUM_AMM)==='1')   list.push(RAYDIUM_AMM_V4_ID);
-  if (String(WATCH_RAYDIUM_CPMM)==='1')  list.push(RAYDIUM_CPMM_ID);
-  if (String(WATCH_RAYDIUM_CLMM)==='1')  list.push(RAYDIUM_CLMM_ID);
+  if (String(WATCH_RAYDIUM_AMM)==='1')      list.push(RAYDIUM_AMM_V4_ID);
+  if (String(WATCH_RAYDIUM_CPMM)==='1')     list.push(RAYDIUM_CPMM_ID);
+  if (String(WATCH_RAYDIUM_CLMM)==='1')     list.push(RAYDIUM_CLMM_ID);
   if (String(WATCH_SPL_TOKEN_LEGACY)==='1') list.push(SPL_TOKEN_LEGACY_ID);
   if (String(WATCH_SPL_TOKEN_2022)==='1')   list.push(SPL_TOKEN_2022_ID);
   return list.map(safePk).filter(Boolean);
@@ -171,8 +179,8 @@ function hasBurnChecked(logs){
   return (logs||[]).some(l => l?.includes('Instruction: BurnChecked') || l?.includes('Instruction: Burn'));
 }
 function hasNoise(logs){
-  const lower=(logs||[]).join('\n').toLowerCase();
-  return NOISE_KEYWORDS.some(k=>lower.includes(k));
+  const text = (Array.isArray(logs) ? logs.join('\n') : String(logs)).toLowerCase();
+  return NOISE_KEYWORDS.some(k=>text.includes(k));
 }
 function hasRaydiumProgramInMessage(tx){
   const keys = tx?.transaction?.message?.accountKeys || [];
@@ -307,23 +315,47 @@ async function processQueue(){
 }
 setInterval(()=> console.log(`[hb] queue=${sigQueue.length} lastSig=${lastSig}`), 10000);
 
-// ===== Subscribe =====
+// ===== Subscribe (WSS előszűrés opcióval) =====
 async function subscribe(){
   const pks=buildPrograms();
   if (pks.length===0){ console.error('Nincs bekapcsolt program (WATCH_*)'); process.exit(1); }
-  console.log('[info] Subscribing onLogs to:', pks.map(p=>p.toBase58()).join(', '), '| RATE_MS=', RATE);
+  console.log('[info] Subscribing onLogs to:', pks.map(p=>p.toBase58()).join(', '), '| RATE_MS=', RATE, '| WSS_PREFILTER=', PREFILTER);
+
   for (const pk of pks){
-    await connection.onLogs(pk, (logs)=>{
-      const sig=logs?.signature; if (!sig) return;
-      enqueue(sig, pk.toBase58().slice(0,6));
+    await connection.onLogs(pk, (ev)=>{
+      const sig = ev?.signature;
+      if (!sig) return;
+
+      let pass = true;
+      if (PREFILTER) {
+        const ll = ev?.logs || [];
+        const text = (Array.isArray(ll) ? ll.join('\n') : String(ll));
+
+        if (PREFILTER_BURN_ONLY && !(/Instruction:\s*BurnChecked|Instruction:\s*Burn/i.test(text))) {
+          pass = false; // nincs Burn/BurnChecked a WSS logban
+        }
+        if (pass && PREFILTER_SKIP_NOISE && /(swap|route|jupiter|aggregator|meteora|goonfi)/i.test(text)) {
+          pass = false; // zaj
+        }
+        if (pass && /(remove\s*liquidity|removeliquidity|withdraw\s*liquidity)/i.test(text)) {
+          pass = false; // remove-liq minta
+        }
+      }
+
+      if (pass) {
+        enqueue(sig, pk.toBase58().slice(0,6));
+      } else if (String(DEBUG)==='1') {
+        console.log('[prefilter-skip]', sig);
+      }
     }, 'confirmed');
+
     console.log('[ok] onLogs subscribed:', pk.toBase58());
   }
 }
 
 // ===== Main =====
 (async function main(){
-  // --- TESZT MÓD: node index.js <signature>  → ugyanaz a pipeline + TG ---
+  // --- TESZT MÓD: node index.js <signature>  → pipeline + TG ---
   if (process.argv[2]) {
     const sig=process.argv[2];
     const tx =await connection.getTransaction(sig,{maxSupportedTransactionVersion:0, commitment:'confirmed'});
@@ -331,7 +363,7 @@ async function subscribe(){
       console.error('Teszt tx nem található');
       return;
     }
-    // debug sorok, hogy lásd miért/miért nem menne át
+    // Debug összefoglaló
     const logs=tx?.meta?.logMessages||[];
     console.log(
       'hasBurnChecked=', hasBurnChecked(logs),
@@ -343,12 +375,11 @@ async function subscribe(){
     const hit=await anyBurnMintHasKnownAuthority(burns);
     console.log('authorityHit=', hit.ok, hit.authority||'');
 
-    // itt már NEM csak kiír — lefut a teljes értékelés és ha valid, TG-t is küld
     const ok = await evaluateAndNotify(sig, tx);
     console.log(ok ? '[test] ALERT sent' : '[test] not eligible');
     return;
   }
 
-  console.log('LP Burn watcher starting… (STRICT_RAYDIUM_PROG=', REQUIRE_RAYDIUM ? 'ON' : 'OFF', ')');
+  console.log('LP Burn watcher starting… (STRICT_RAYDIUM_PROG=', REQUIRE_RAYDIUM ? 'ON' : 'OFF', ', WSS_PREFILTER=', PREFILTER ? 'ON' : 'OFF', ')');
   await subscribe();
 })();
