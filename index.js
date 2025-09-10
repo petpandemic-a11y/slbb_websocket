@@ -1,9 +1,4 @@
-// index.js — Raydium LP burn watcher
-// - WebSocket figyelés (Raydium AMM/CPMM programok)
-// - Authority-only vagy program+authority (ENV-ből kapcsolható)
-// - Queue + heartbeat log Renderre
-// - Telegram értesítés HTML formázással (safe escape), stabil küldés
-// - Teszt mód: node index.js <signature>
+// index.js — Raydium LP burn watcher (HTML-es TG, queue + heartbeat, progress log)
 
 import 'dotenv/config';
 import WebSocket from 'ws';
@@ -20,10 +15,10 @@ const {
   RAYDIUM_AUTHORITIES = '',
   AUTO_LEARN_AUTHORITIES = '1',
 
-  // 0 = authority-only is elég; 1 = KELL Raydium programnyom is
+  // 0 = authority-only is elég; 1 = Raydium programnyom is kell
   REQUIRE_RAYDIUM_PROGRAM = '0',
 
-  // finomhangolás / védelem
+  // finomhangolás
   REQUIRE_INCINERATOR = '0',
   MAX_UNDERLYING_UP_MINTS = '2',
   UNDERLYING_UP_EPS = '0.000001',
@@ -32,13 +27,11 @@ const {
   SKIP_MINTS = '',
 } = process.env;
 
-// Raydium programok (AMM/CPMM)
 const RAYDIUM_PROGRAM_IDS = [
   'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C',
   'CAMMCzo5YL8w4VFF8KVHRk22GGUsp5VTaW7girrKgIrwQk',
 ];
 
-// Beépített Raydium mintAuthority (bővíthető ENV-vel + auto-learn)
 const DEFAULT_RAYDIUM_AUTHORITIES = [
   '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Raydium Authority V4
 ];
@@ -54,7 +47,7 @@ const httpUrl = RPC_HTTP;
 const SKIP_SIG_SET = new Set(SKIP_SIGNATURES.split(',').map(s=>s.trim()).filter(Boolean));
 const SKIP_MINT_SET = new Set(SKIP_MINTS.split(',').map(s=>s.trim()).filter(Boolean));
 
-// ---- Authority tároló (env + file + defaults)
+// ---- Authority store (env + file + defaults)
 const AUTH_FILE = './raydium_authorities.json';
 let learnedAuth = new Set();
 try {
@@ -87,7 +80,7 @@ async function sendToTG(text) {
       body: JSON.stringify({
         chat_id: TG_CHAT_ID,
         text,
-        parse_mode: 'HTML',           // HTML formázás
+        parse_mode: 'HTML',
         disable_web_page_preview: true
       }),
     });
@@ -144,7 +137,7 @@ function analyzeUnderlyingMovements(tx) {
 }
 
 // ---- mintAuthority cache + lekérés
-const mintAuthCache = new Map(); // mint -> { authority, when }
+const mintAuthCache = new Map();
 async function fetchMintAuthority(mint) {
   if (!httpUrl) return null;
   if (mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
@@ -169,7 +162,7 @@ async function anyBurnMintHasKnownAuthority(burns) {
   return { ok:false, seen };
 }
 
-// ---- Authority auto-learn (csak Raydium programnyom esetén)
+// ---- Auto-learn (csak ha Raydium programnyom van)
 async function learnAuthoritiesFromTx(tx) {
   if (String(AUTO_LEARN_AUTHORITIES) !== '1') return;
   if (!includesRaydium(tx)) return;
@@ -198,7 +191,10 @@ function buildMsg(tx, info){
   if (sig)  out += `<b>Tx:</b> <code>${escapeHtml(sig)}</code>\n`;
   if (time) out += `<b>Time:</b> ${escapeHtml(time)}\n`;
   if (slot) out += `<b>Slot:</b> ${escapeHtml(slot)}\n`;
-  out += `<b>Evidence:</b> ${escapeHtml(info?.raydiumEvidence || 'authority_only')}\n`;
+
+  // 💡 evidence is escape-elt + emoji külön a végén
+  const evidence = escapeHtml(info?.raydiumEvidence || 'authority_only');
+  out += `<b>Evidence:</b> ${evidence} ✅\n`;
 
   const byMint = new Map();
   for (const b of burns) byMint.set(b.mint, (byMint.get(b.mint)||0)+b.amount);
@@ -214,7 +210,7 @@ function buildMsg(tx, info){
   return out;
 }
 
-// ---- Döntés: authority kötelező; programnyom ENV-től függ
+// ---- Döntés
 async function whyNotPureLPBurn(tx) {
   const sig = tx?.transaction?.signatures?.[0] || '';
   if (SKIP_SIG_SET.has(sig)) return { ok:false, reason:'manual_skip' };
@@ -224,23 +220,19 @@ async function whyNotPureLPBurn(tx) {
   if (burns.length === 0) return { ok:false, reason:'no_lp_delta' };
   if (totalBurnUi(burns) < Number(MIN_BURN_UI)) return { ok:false, reason:'too_small_burn' };
 
-  // Kötelező: legalább egy burnölt mint authority-je Raydium
   const authHit = await anyBurnMintHasKnownAuthority(burns);
   if (!authHit.ok) return { ok:false, reason:'no_raydium_authority' };
 
-  // Programnyom – csak ha kérjük
   const hasProg = includesRaydium(tx);
   if (String(REQUIRE_RAYDIUM_PROGRAM) === '1' && !hasProg) {
     return { ok:false, reason:'no_raydium_program' };
   }
 
-  // Opcionális: incinerator
   const viaIncin = JSON.stringify(tx).includes(INCINERATOR);
   if (String(REQUIRE_INCINERATOR) === '1' && !viaIncin) {
     return { ok:false, reason:'incinerator_required' };
   }
 
-  // Underlying növekmény szűrés
   const agg = analyzeUnderlyingMovements(tx);
   const eps = Number(UNDERLYING_UP_EPS);
   const ups = Object.values(agg).filter(v => v > eps).length;
@@ -291,7 +283,7 @@ async function processQueue(){
   processing = false;
 }
 
-// Heartbeat: 10 mp-enként állapot log
+// Heartbeat
 setInterval(()=>{
   console.log(`[hb]: connected=${connected} queue=${queue.length} lastSig=${lastSig}`);
 }, 10000);
@@ -335,7 +327,7 @@ async function testSignature(sig){
   }catch(e){ console.error('Teszt hiba:', e.message); }
 }
 
-// ---------------- Indítás ----------------
+// ---------------- Start ----------------
 (async function main(){
   console.log('LP Burn watcher starting…');
   if (process.argv[2]) { await testSignature(process.argv[2]); }
