@@ -344,6 +344,76 @@ class RaydiumLPBurnMonitor {
     }
 
     /**
+     * Heuristic detection of Remove Liquidity (CPMM/AMM) transactions
+     * Returns true if the tx looks like a remove-liquidity (LP burn + base+quote payout to user),
+     * so we should NOT alert this as a permanent LP burn.
+     */
+    isRemoveLiquidityTx(tx) {
+        try {
+            const logs = (tx?.meta?.logMessages || []).join(' ').toLowerCase();
+
+            // 1) Must contain a Burn/BurnChecked on some token (likely LP mint)
+            const ixs = tx?.transaction?.message?.instructions || [];
+            let hasBurnIx = false;
+            for (const ix of ixs) {
+                const p = ix.parsed;
+                if (p && p.type && (p.type === 'burn' || p.type === 'burnChecked')) {
+                    hasBurnIx = true;
+                    break;
+                }
+            }
+            if (!hasBurnIx) return false;
+
+            // 2) Detect two different mint inflows (base + quote) to the same owner
+            const pre = tx?.meta?.preTokenBalances || [];
+            const post = tx?.meta?.postTokenBalances || [];
+
+            const acct = new Map(); // accountIndex -> {owner, mint, pre, post}
+            for (const b of pre) {
+                acct.set(b.accountIndex, {
+                    owner: b.owner,
+                    mint: b.mint,
+                    pre: Number(b.uiTokenAmount?.uiAmountString || 0),
+                    post: 0
+                });
+            }
+            for (const b of post) {
+                const row = acct.get(b.accountIndex) || { owner: b.owner, mint: b.mint, pre: 0, post: 0 };
+                row.owner = b.owner;
+                row.mint = b.mint;
+                row.post = Number(b.uiTokenAmount?.uiAmountString || 0);
+                acct.set(b.accountIndex, row);
+            }
+
+            const inflows = [];
+            for (const [, row] of acct) {
+                const delta = row.post - row.pre;
+                if (delta > 0) inflows.push({ owner: row.owner, mint: row.mint, delta });
+            }
+
+            const ownerToMints = new Map();
+            for (const r of inflows) {
+                if (!ownerToMints.has(r.owner)) ownerToMints.set(r.owner, new Set());
+                ownerToMints.get(r.owner).add(r.mint);
+            }
+            let hasTwoMintsToSameOwner = false;
+            for (const [, mints] of ownerToMints) {
+                if (mints.size >= 2) { hasTwoMintsToSameOwner = true; break; }
+            }
+            if (!hasTwoMintsToSameOwner) return false;
+
+            // 3) Raydium/CPMM remove-liquidity hints in logs
+            const removeHints = ['remove liquidity', 'removeliquidity', 'decrease liquidity', 'cpmm', 'raydium'];
+            const hasRemoveHints = removeHints.some(k => logs.includes(k));
+
+            return hasRemoveHints;
+        } catch (e) {
+            logger.warn(`isRemoveLiquidityTx() failed: ${e.message}`);
+            return false;
+        }
+    }
+
+    /**
      * Analyze transaction for LP burn
      */
     async analyzeTransaction(signature, slot) {
@@ -409,6 +479,14 @@ class RaydiumLPBurnMonitor {
                 return;
             }
             
+            
+            // Extra guard: skip classic remove-liquidity flows (LP burn + base/quote payout)
+            if (this.isRemoveLiquidityTx(tx)) {
+                logger.debug('[SKIP] Remove-liquidity pattern detected (LP burn is part of withdrawal).');
+                // mark as processed false so we don't keep it
+                this.detectedBurns.delete(signature);
+                return;
+            }
             // Analyze for LP burn
             const burnInfo = await this.extractBurnInfo(tx);
             
