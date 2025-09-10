@@ -215,27 +215,40 @@ class RaydiumLPBurnMonitor {
             return;
         }
         
-        // Look for REAL burn patterns only
-        const hasBurn = logMessages.some(log => 
+        // IMPORTANT: Skip RemoveLiquidity - we only want permanent burns
+        const isRemoveLiquidity = logMessages.some(log =>
             log && (
-                log.includes('Instruction: Burn') ||
-                log.includes('Instruction: BurnChecked') ||
                 log.toLowerCase().includes('remove liquidity') ||
                 log.toLowerCase().includes('removeliquidity') ||
-                // Must be TO a burn address, not FROM
-                (BURN_ADDRESSES.some(addr => log.includes(addr)) && 
-                 (log.includes('Transfer') || log.includes('transfer')))
+                log.toLowerCase().includes('withdraw liquidity')
             )
         );
         
-        // Skip if no burn pattern
-        if (!hasBurn) {
-            logger.debug(`No burn pattern in tx: ${signature.slice(0, 8)}...`);
+        if (isRemoveLiquidity) {
+            logger.debug(`Skipping RemoveLiquidity - not a permanent burn: ${signature.slice(0, 8)}...`);
             return;
         }
         
-        // This looks like a real LP burn!
-        logger.info(`🔥 Potential LP burn detected in Raydium tx: ${signature.slice(0, 8)}...`);
+        // Look for PERMANENT burn patterns only
+        const hasPermanentBurn = logMessages.some(log => 
+            log && (
+                log.includes('Instruction: Burn') ||
+                log.includes('Instruction: BurnChecked') ||
+                // Transfer TO a burn address (permanent)
+                (BURN_ADDRESSES.some(addr => log.includes(addr)) && 
+                 log.includes('Transfer') &&
+                 !log.toLowerCase().includes('remove'))
+            )
+        );
+        
+        // Skip if no permanent burn pattern
+        if (!hasPermanentBurn) {
+            logger.debug(`No permanent burn pattern in tx: ${signature.slice(0, 8)}...`);
+            return;
+        }
+        
+        // This looks like a PERMANENT LP burn!
+        logger.info(`🔥 PERMANENT LP burn detected in Raydium tx: ${signature.slice(0, 8)}...`);
         
         // Queue for processing
         this.queueTransaction(signature, context.slot);
@@ -426,34 +439,19 @@ class RaydiumLPBurnMonitor {
                 return null;
             }
             
-            // CRITICAL: Skip ALL swap transactions
+            // Since we're only monitoring Raydium programs, we know this is Raydium-related
+            // But still skip pure swaps
             if (meta.logMessages) {
                 const isSwap = meta.logMessages.some(log => 
                     log && (
-                        log.toLowerCase().includes('swap') ||
-                        log.toLowerCase().includes('jupiter') ||
-                        log.toLowerCase().includes('trade') ||
-                        log.toLowerCase().includes('route')
+                        log.toLowerCase().includes('swap') && 
+                        !log.toLowerCase().includes('remove') &&
+                        !log.toLowerCase().includes('burn')
                     )
                 );
                 
                 if (isSwap) {
-                    logger.debug('Skipping swap transaction - not a burn');
-                    return null;
-                }
-                
-                // Must have a real burn instruction
-                const hasBurnInstruction = meta.logMessages.some(log =>
-                    log && (
-                        log.includes('Instruction: Burn') ||
-                        log.includes('Instruction: BurnChecked') ||
-                        log.toLowerCase().includes('remove liquidity') ||
-                        log.toLowerCase().includes('removeliquidity')
-                    )
-                );
-                
-                if (!hasBurnInstruction) {
-                    logger.debug('No burn instruction found - not a burn');
+                    logger.debug('Skipping swap transaction');
                     return null;
                 }
             }
@@ -466,10 +464,10 @@ class RaydiumLPBurnMonitor {
                 poolId: null,
                 timestamp: tx.blockTime,
                 solValue: 0,
-                isLPToken: true // Since we're only monitoring Raydium LP programs
+                isLPToken: true // Since we're only monitoring Raydium, assume it's LP
             };
             
-            // Find ONLY token DECREASES (burns), not increases (buys)
+            // Find token burns
             for (let i = 0; i < meta.preTokenBalances.length; i++) {
                 const pre = meta.preTokenBalances[i];
                 if (!pre || !pre.uiTokenAmount) continue;
@@ -483,39 +481,58 @@ class RaydiumLPBurnMonitor {
                 const preAmount = BigInt(pre.uiTokenAmount.amount || 0);
                 const postAmount = BigInt(post.uiTokenAmount.amount || 0);
                 
-                // CRITICAL: Only detect DECREASES, not increases
-                if (preAmount <= postAmount) {
-                    continue; // Skip if balance increased or stayed same
+                let burnDetected = false;
+                let burnAmount = 0n;
+                
+                // Check for burn to null address
+                if (post.owner && BURN_ADDRESSES.includes(post.owner) && postAmount > preAmount) {
+                    burnAmount = postAmount - preAmount;
+                    burnDetected = true;
+                }
+                // Check for direct burn (balance to 0)
+                else if (preAmount > 0n && postAmount === 0n && pre.owner && !BURN_ADDRESSES.includes(pre.owner)) {
+                    burnAmount = preAmount;
+                    burnDetected = true;
+                    burnInfo.burner = pre.owner;
+                    burnInfo.burnPercentage = 1.0;
+                }
+                // Check for significant reduction (>90%)
+                else if (preAmount > 0n && postAmount < preAmount) {
+                    burnAmount = preAmount - postAmount;
+                    const percentage = Number(burnAmount) / Number(preAmount);
+                    if (percentage > 0.9) {
+                        burnDetected = true;
+                        burnInfo.burnPercentage = percentage;
+                    }
                 }
                 
-                // Check if this is a significant decrease
-                const burnAmount = preAmount - postAmount;
-                const burnPercentage = Number(burnAmount) / Number(preAmount);
-                
-                // Only consider high percentage burns (>90%)
-                if (burnPercentage < 0.9) {
-                    continue;
-                }
-                
-                // Check if it's a burn to null address
-                const isBurnToNull = post.owner && BURN_ADDRESSES.includes(post.owner);
-                
-                // Check if it's a complete burn (balance to 0)
-                const isCompleteBurn = postAmount === 0n && !BURN_ADDRESSES.includes(pre.owner);
-                
-                if (isBurnToNull || isCompleteBurn) {
+                if (burnDetected && burnAmount > 0n) {
                     burnInfo.tokenMint = pre.mint;
                     burnInfo.burnAmount = Number(burnAmount) / Math.pow(10, pre.uiTokenAmount.decimals || 9);
-                    burnInfo.burnPercentage = burnPercentage;
-                    burnInfo.burner = pre.owner;
                     
-                    logger.info(`Found burn: ${burnInfo.burnAmount} tokens (${(burnPercentage * 100).toFixed(1)}%)`);
-                    break; // Found a burn, stop looking
+                    // If no burner found yet, find sender
+                    if (!burnInfo.burner) {
+                        const sender = meta.preTokenBalances.find(b => 
+                            b && b.mint === pre.mint && 
+                            b.owner && !BURN_ADDRESSES.includes(b.owner) &&
+                            BigInt(b.uiTokenAmount?.amount || 0) >= burnAmount
+                        );
+                        
+                        if (sender && sender.owner) {
+                            burnInfo.burner = sender.owner;
+                            const senderPreAmount = BigInt(sender.uiTokenAmount?.amount || 0);
+                            if (senderPreAmount > 0n && burnInfo.burnPercentage === 0) {
+                                burnInfo.burnPercentage = Number(burnAmount) / Number(senderPreAmount);
+                            }
+                        }
+                    }
+                    
+                    // Found a burn, return it
+                    break;
                 }
             }
             
             if (!burnInfo.tokenMint) {
-                logger.debug('No valid burn found in transaction');
                 return null;
             }
             
