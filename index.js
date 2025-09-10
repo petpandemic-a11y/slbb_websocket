@@ -402,4 +402,3 @@ async function subscribe(){
   console.log('LP Burn watcher starting… (STRICT_RAYDIUM_PROG=', REQUIRE_RAYDIUM ? 'ON' : 'OFF', ', WSS_PREFILTER=', PREFILTER ? 'ON' : 'OFF', ')');
   await subscribe();
 })();
-```0
