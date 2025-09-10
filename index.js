@@ -1,15 +1,7 @@
 // index.js — Raydium LP burn watcher
-// WS figyelés + Test mód + REASON logging + Raydium Authority ellenőrzés
-// + AUTO_LEARN_AUTHORITIES + beépített Raydium authority(-k)
-
-// ENV (a feltöltött .env-edhez illeszkedik):
-// DEBUG=1
-// RPC_WSS=wss://mainnet.helius-rpc.com/?api-key=...
-// RPC_HTTP=https://mainnet.helius-rpc.com/?api-key=...
-// TG_BOT_TOKEN=xxxxx
-// TG_CHAT_ID=xxxxx
-// AUTO_LEARN_AUTHORITIES=1
-// RAYDIUM_AUTHORITIES=   // opcionális, vesszővel elválasztott lista
+// WS figyelés + Test mód + REASON logging
+// + Raydium Authority ellenőrzés (beépített + ENV + auto-learn)
+// + LP-név/szimbólum ellenőrzés (REQUIRE_LP_NAME, LP_NAME_KEYWORDS)
 
 import 'dotenv/config';
 import WebSocket from 'ws';
@@ -22,21 +14,34 @@ const {
   RPC_HTTP,
   TG_BOT_TOKEN,
   TG_CHAT_ID,
+
+  // Raydium authority lista (opcionális, vesszővel)
   RAYDIUM_AUTHORITIES = '',
+
+  // Authority auto-tanulás Raydium programnyom alapján
   AUTO_LEARN_AUTHORITIES = '1',
+
+  // LP-név szigor: ha 1 → csak akkor jelez, ha a mint neve/szimbóluma LP-re utal
+  REQUIRE_LP_NAME = '1',
+  // vesszővel elválasztva; nagybetűs rész-illesztés történik
+  LP_NAME_KEYWORDS = 'LP,LP TOKEN,LIQUIDITY PROVIDER',
+
+  // opcionális szigorítások
+  REQUIRE_INCINERATOR = '0',
+  MAX_UNDERLYING_UP_MINTS = '2',
+  UNDERLYING_UP_EPS = '0.000001',
+  MIN_BURN_UI = '0',
+  SKIP_SIGNATURES = ''
 } = process.env;
 
-// Raydium AMM/CPMM programok
 const RAYDIUM_PROGRAM_IDS = [
   'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C',
   'CAMMCzo5YL8w4VFF8KVHRk22GGUsp5VTaW7girrKgIrwQk',
 ];
 
-// 🔒 Beépített (known-good) Raydium mintAuthority címek (bővíthető)
-// — A te debugodból biztosan: Raydium Authority V4
+// 🔒 Beépített (known-good) Raydium mintAuthority cím(ek)
 const DEFAULT_RAYDIUM_AUTHORITIES = [
-  '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Raydium Authority V4 (Solscan screenshot alapján)
-  // Ha van további biztos V2/V3/V5 címed, ide felveheted, vagy tedd az ENV-be.
+  '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Raydium Authority V4
 ];
 
 const INCINERATOR = '1nc1nerator11111111111111111111111111111111';
@@ -48,8 +53,6 @@ const httpUrl = RPC_HTTP;
 
 const AUTH_FILE = './raydium_authorities.json';
 let learnedAuth = new Set();
-
-// Betöltés fájlból (tanult authority-k)
 try {
   if (fs.existsSync(AUTH_FILE)) {
     const arr = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
@@ -57,7 +60,6 @@ try {
   }
 } catch {}
 
-// Egyesítsük: beépített + ENV + tanult
 DEFAULT_RAYDIUM_AUTHORITIES.forEach(a => learnedAuth.add(a));
 RAYDIUM_AUTHORITIES.split(',').map(s=>s.trim()).filter(Boolean).forEach(a => learnedAuth.add(a));
 
@@ -66,7 +68,6 @@ function persistLearned() {
   catch (e) { logDbg('persist error:', e.message); }
 }
 
-// --- Telegram ---
 async function sendToTG(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   try {
@@ -81,7 +82,10 @@ async function sendToTG(text) {
   }
 }
 
-// --- Helpers ---
+// ---------- Helpers ----------
+const SKIP_SIG_SET = new Set(SKIP_SIGNATURES.split(',').map(s=>s.trim()).filter(Boolean));
+const LP_KEYS = LP_NAME_KEYWORDS.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
+
 function hasRemoveHints(obj) {
   try { return SKIP_KEYWORDS.some(k => JSON.stringify(obj).toLowerCase().includes(k)); }
   catch { return false; }
@@ -130,8 +134,10 @@ function analyzeUnderlyingMovements(tx) {
   } catch (e) { logDbg('analyzeUnderlyingMovements error:', e.message); return {}; }
 }
 
-// mintAuthority cache + lekérés
-const mintAuthCache = new Map();
+// mintAuthority & meta cache + lekérés
+const mintAuthCache = new Map(); // mint -> { authority, when }
+const mintMetaCache = new Map(); // mint -> { name, symbol, when }
+
 async function fetchMintAuthority(mint) {
   if (!httpUrl) return null;
   if (mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
@@ -144,6 +150,21 @@ async function fetchMintAuthority(mint) {
     logDbg('mintAuthority', mint, '→', authority);
     return authority;
   } catch (e) { logDbg('fetchMintAuthority err:', e.message); return null; }
+}
+
+async function fetchMintNameSymbol(mint) {
+  if (!httpUrl) return { name:'', symbol:'' };
+  if (mintMetaCache.has(mint)) return mintMetaCache.get(mint);
+  try {
+    const body = { jsonrpc:'2.0', id:'tokenmeta', method:'getAccountInfo', params:[mint, {encoding:'jsonParsed', commitment:'confirmed'}] };
+    const res = await fetch(httpUrl, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+    const j = await res.json();
+    const info = j?.result?.value?.data?.parsed?.info || {};
+    const meta = { name: info?.name || '', symbol: info?.symbol || '', when: Date.now() };
+    mintMetaCache.set(mint, meta);
+    logDbg('mintMeta', mint, '→', meta.name, '/', meta.symbol);
+    return meta;
+  } catch (e) { logDbg('fetchMintNameSymbol err:', e.message); return { name:'', symbol:'' }; }
 }
 
 async function anyBurnMintHasKnownAuthority(burns) {
@@ -168,30 +189,6 @@ async function learnAuthoritiesFromTx(tx) {
   }
 }
 
-// döntés
-async function whyNotPureLPBurn(tx) {
-  if (hasRemoveHints(tx)) return { ok:false, reason:'remove_hint' };
-  const burns = extractBurns(tx);
-  if (burns.length === 0) return { ok:false, reason:'no_lp_delta' };
-
-  let evidence = '';
-  if (includesRaydium(tx)) evidence = 'program';
-  if (!evidence) {
-    const hit = await anyBurnMintHasKnownAuthority(burns);
-    if (hit.ok) evidence = 'authority';
-  }
-  if (!evidence) return { ok:false, reason:'no_raydium_and_no_authority_match' };
-
-  try {
-    const agg = analyzeUnderlyingMovements(tx);
-    const viaIncin = JSON.stringify(tx).includes(INCINERATOR);
-    const bigUps = Object.values(agg).filter(v => v > 0).length;
-    if (bigUps >= 2 && !viaIncin) return { ok:false, reason:'double_underlying_no_incin', details:{bigUps} };
-  } catch {}
-
-  return { ok:true, reason:'ok', burns, raydiumEvidence:evidence };
-}
-
 function fmtNum(x){ if(!isFinite(x))return String(x); if(Math.abs(x)>=1) return x.toLocaleString('en-US',{maximumFractionDigits:4}); return x.toExponential(4); }
 function buildMsg(tx, info){
   const sig = tx?.transaction?.signatures?.[0] || tx?.signature || '';
@@ -212,7 +209,68 @@ function buildMsg(tx, info){
   return out;
 }
 
-// WS
+function totalBurnUi(burns) {
+  return burns.reduce((s,b)=> s + (Number.isFinite(b.amount) ? b.amount : 0), 0);
+}
+
+// ---------- Döntés ----------
+async function isLikelyLpMint(mint) {
+  // LP név/szimbólum ellenőrzés
+  const { name, symbol } = await fetchMintNameSymbol(mint);
+  const upper = (name + ' ' + symbol).toUpperCase();
+  if (LP_KEYS.length && LP_KEYS.some(k => upper.includes(k))) return true;
+  // ha kötelező a név-alapú jelzés és nem találtunk kulcsszót → nem LP
+  if (String(REQUIRE_LP_NAME) === '1') return false;
+  // lazább módban, ha nincs infó, nem zárjuk ki pusztán emiatt
+  return true;
+}
+
+async function whyNotPureLPBurn(tx) {
+  const sig = tx?.transaction?.signatures?.[0] || '';
+  if (SKIP_SIG_SET.has(sig)) return { ok:false, reason:'manual_skip' };
+
+  if (hasRemoveHints(tx)) return { ok:false, reason:'remove_hint' };
+
+  const burns = extractBurns(tx);
+  if (burns.length === 0) return { ok:false, reason:'no_lp_delta' };
+
+  if (totalBurnUi(burns) < Number(MIN_BURN_UI)) {
+    return { ok:false, reason:'too_small_burn' };
+  }
+
+  // Minden burnölt mintről bizonyosodjunk meg, hogy LP-jellegű
+  for (const b of burns) {
+    const isLp = await isLikelyLpMint(b.mint);
+    if (!isLp) return { ok:false, reason:'mint_not_lp' };
+  }
+
+  // Raydium evidence: program vagy authority
+  let evidence = '';
+  if (includesRaydium(tx)) evidence = 'program';
+  if (!evidence) {
+    const hit = await anyBurnMintHasKnownAuthority(burns);
+    if (hit.ok) evidence = 'authority';
+  }
+  if (!evidence) return { ok:false, reason:'no_raydium_and_no_authority_match' };
+
+  // Incinerator követelmény (ha be van kapcsolva)
+  const viaIncin = JSON.stringify(tx).includes(INCINERATOR);
+  if (String(REQUIRE_INCINERATOR) === '1' && !viaIncin) {
+    return { ok:false, reason:'incinerator_required' };
+  }
+
+  // Underlying növekmények szigorítása
+  const agg = analyzeUnderlyingMovements(tx);
+  const eps = Number(UNDERLYING_UP_EPS);
+  const ups = Object.values(agg).filter(v => v > eps).length;
+  if (ups > Number(MAX_UNDERLYING_UP_MINTS)) {
+    if (!viaIncin) return { ok:false, reason:'underlying_growth_without_incin', details:{ups} };
+  }
+
+  return { ok:true, reason:'ok', burns, raydiumEvidence:evidence };
+}
+
+// ---------- WebSocket ----------
 let ws, reconnTimer; const RECONNECT_MS=5000;
 function connectWS(){
   if(!wsUrl){ console.error('Hiányzik RPC_WSS'); process.exit(1); }
@@ -228,7 +286,6 @@ function connectWS(){
     if (m.method==='transactionNotification'){
       const tx = m?.params?.result?.transaction || m?.params?.result;
       const sig = tx?.transaction?.signatures?.[0] || '';
-      // tanulás Raydium nyom alapján (ha engedélyezve)
       await learnAuthoritiesFromTx(tx);
 
       const check = await whyNotPureLPBurn(tx);
@@ -243,7 +300,7 @@ function connectWS(){
 }
 function scheduleReconnect(){ if(reconnTimer) return; reconnTimer=setTimeout(()=>{reconnTimer=null; connectWS();}, RECONNECT_MS); }
 
-// Test mód
+// ---------- Teszt mód ----------
 async function testSignature(sig){
   if(!httpUrl){ console.error('Hiányzik RPC_HTTP'); process.exit(1); }
   try{
@@ -251,8 +308,11 @@ async function testSignature(sig){
     const res=await fetch(httpUrl,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
     const j=await res.json(); const tx=j?.result; if(!tx){ console.error('Nem találtam tranzakciót ehhez a signature-höz.'); console.error(j); return; }
     const burns=extractBurns(tx);
-    for(const b of burns){ const auth=await fetchMintAuthority(b.mint); console.log(`mint=${b.mint} mintAuthority=${auth||'null'}`); }
-    // tanulás (ha raydium program is látszik)
+    for (const b of burns) {
+      const auth=await fetchMintAuthority(b.mint);
+      const {name,symbol}=await fetchMintNameSymbol(b.mint);
+      console.log(`mint=${b.mint} mintAuthority=${auth||'null'} name="${name||''}" symbol="${symbol||''}"`);
+    }
     await learnAuthoritiesFromTx(tx);
     const check=await whyNotPureLPBurn(tx);
     console.log(`TEST ${sig} looksLikePureLPBurn=${check.ok} reason=${check.reason} evidence=${check.raydiumEvidence||''}`);
@@ -260,7 +320,7 @@ async function testSignature(sig){
   }catch(e){ console.error('Teszt hiba:', e.message); }
 }
 
-// Indítás
+// ---------- Indítás ----------
 (async function main(){
   console.log('LP Burn watcher starting…');
   if(process.argv[2]){ await testSignature(process.argv[2]); }
