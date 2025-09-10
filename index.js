@@ -1,4 +1,5 @@
-// index.js — Raydium LP burn watcher (HTML-es TG, queue + heartbeat, progress log)
+// index.js — Raydium LP burn watcher (HTML TG, queue + heartbeat)
+// ÚJ: ENV-ből kapcsolható program-figyelés és teljes RX log
 
 import 'dotenv/config';
 import WebSocket from 'ws';
@@ -15,7 +16,7 @@ const {
   RAYDIUM_AUTHORITIES = '',
   AUTO_LEARN_AUTHORITIES = '1',
 
-  // 0 = authority-only is elég; 1 = Raydium programnyom is kell
+  // 0 = authority-only is elég; 1 = KELL Raydium programnyom is
   REQUIRE_RAYDIUM_PROGRAM = '0',
 
   // finomhangolás
@@ -25,21 +26,41 @@ const {
   MIN_BURN_UI = '0',
   SKIP_SIGNATURES = '',
   SKIP_MINTS = '',
+
+  // ÚJ kapcsolók
+  WATCH_RAYDIUM_PROGRAMS = '1',
+  WATCH_TOKEN_2022 = '0',
+  WATCH_TOKEN_LEGACY = '0',
+  LOG_ALL_TX = '0',
 } = process.env;
 
+const logDbg = (...a) => { if (String(DEBUG) === '1') console.log('[debug]:', ...a); };
+
+// --- Program IDs
 const RAYDIUM_PROGRAM_IDS = [
   'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C',
   'CAMMCzo5YL8w4VFF8KVHRk22GGUsp5VTaW7girrKgIrwQk',
 ];
+const SPL_TOKEN_2022 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'; // amit kértél
+const SPL_TOKEN_LEGACY = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 
+function buildProgramSubscribeList() {
+  const arr = [];
+  if (String(WATCH_RAYDIUM_PROGRAMS) !== '0') arr.push(...RAYDIUM_PROGRAM_IDS);
+  if (String(WATCH_TOKEN_2022) === '1') arr.push(SPL_TOKEN_2022);
+  if (String(WATCH_TOKEN_LEGACY) === '1') arr.push(SPL_TOKEN_LEGACY);
+  // ne maradjon üres – default Raydium
+  if (arr.length === 0) arr.push(...RAYDIUM_PROGRAM_IDS);
+  return arr;
+}
+
+// Beépített Raydium authorities
 const DEFAULT_RAYDIUM_AUTHORITIES = [
   '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Raydium Authority V4
 ];
 
 const INCINERATOR = '1nc1nerator11111111111111111111111111111111';
 const SKIP_KEYWORDS = ['remove', 'remove_liquidity', 'withdraw', 'remove-liquidity'];
-
-const logDbg = (...a) => { if (String(DEBUG) === '1') console.log('[debug]:', ...a); };
 
 const wsUrl = RPC_WSS;
 const httpUrl = RPC_HTTP;
@@ -66,10 +87,7 @@ function persistLearned() {
 
 // ---- Telegram (HTML mód + safe escape)
 function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 async function sendToTG(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
@@ -95,9 +113,12 @@ function hasRemoveHints(obj) {
   try { return SKIP_KEYWORDS.some(k => JSON.stringify(obj).toLowerCase().includes(k)); }
   catch { return false; }
 }
-function includesRaydium(tx) {
-  try { return RAYDIUM_PROGRAM_IDS.some(id => JSON.stringify(tx).includes(id)); }
+function includesProgram(tx, programId) {
+  try { return JSON.stringify(tx).includes(programId); }
   catch { return false; }
+}
+function includesRaydium(tx) {
+  return RAYDIUM_PROGRAM_IDS.some(id => includesProgram(tx, id));
 }
 
 function extractBurns(tx) {
@@ -137,7 +158,7 @@ function analyzeUnderlyingMovements(tx) {
 }
 
 // ---- mintAuthority cache + lekérés
-const mintAuthCache = new Map();
+const mintAuthCache = new Map(); // mint -> { authority, when }
 async function fetchMintAuthority(mint) {
   if (!httpUrl) return null;
   if (mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
@@ -162,7 +183,7 @@ async function anyBurnMintHasKnownAuthority(burns) {
   return { ok:false, seen };
 }
 
-// ---- Auto-learn (csak ha Raydium programnyom van)
+// ---- Auto-learn (ha van Raydium programnyom)
 async function learnAuthoritiesFromTx(tx) {
   if (String(AUTO_LEARN_AUTHORITIES) !== '1') return;
   if (!includesRaydium(tx)) return;
@@ -191,8 +212,6 @@ function buildMsg(tx, info){
   if (sig)  out += `<b>Tx:</b> <code>${escapeHtml(sig)}</code>\n`;
   if (time) out += `<b>Time:</b> ${escapeHtml(time)}\n`;
   if (slot) out += `<b>Slot:</b> ${escapeHtml(slot)}\n`;
-
-  // 💡 evidence is escape-elt + emoji külön a végén
   const evidence = escapeHtml(info?.raydiumEvidence || 'authority_only');
   out += `<b>Evidence:</b> ${evidence} ✅\n`;
 
@@ -252,7 +271,14 @@ let lastSig = '-';
 
 function enqueue(tx){
   const sig = tx?.transaction?.signatures?.[0] || '';
-  console.log(`[debug]: Potential burn detected in tx: ${sig}`);
+  if (String(LOG_ALL_TX) === '1') {
+    const hasRay = includesRaydium(tx);
+    const hasTok22 = includesProgram(tx, SPL_TOKEN_2022);
+    const hasTokLegacy = includesProgram(tx, SPL_TOKEN_LEGACY);
+    console.log(`[rx] ${sig}  raydium=${hasRay} token22=${hasTok22} tokenLegacy=${hasTokLegacy}`);
+  } else {
+    console.log(`[debug]: Potential burn detected in tx: ${sig}`);
+  }
   queue.push(tx);
   console.log(`[info]:  🔥 Queued transaction: ${sig} (queue size: ${queue.length})`);
   processQueue();
@@ -295,12 +321,14 @@ function connectWS(){
   ws.on('open', ()=>{
     connected = true;
     console.log('[INFO] WebSocket opened:', wsUrl);
+
+    const programs = buildProgramSubscribeList();
     const sub = {
       jsonrpc:'2.0', id:1, method:'transactionSubscribe',
-      params:[{ accounts:{ any:RAYDIUM_PROGRAM_IDS }, commitment:'confirmed' }]
+      params:[{ accounts:{ any: programs }, commitment:'confirmed' }]
     };
     ws.send(JSON.stringify(sub));
-    console.log('[INFO] Feliratkozás elküldve Raydium programokra.');
+    console.log('[INFO] Feliratkozás elküldve ezekre a programokra:', programs.join(', '));
   });
   ws.on('message', (buf)=>{
     let m; try{ m=JSON.parse(buf.toString()); } catch{ return; }
