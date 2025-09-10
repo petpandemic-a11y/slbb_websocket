@@ -1,5 +1,5 @@
-// index.js — Raydium LP Burn watcher (ultra low-noise)
-// ÚJ: STRICT_NO_NONLP_INCREASE=1  → bármilyen nem-LP token növekmény esetén dobjuk (remove-liq biztosan kiesik)
+// index.js — Raydium LP Burn watcher (ultra low-noise, fixed post-only increases)
+// STRICT_NO_NONLP_INCREASE=1 → bármilyen nem-LP token növekmény esetén drop (remove-liq biztosan kiesik)
 
 import 'dotenv/config';
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -30,7 +30,7 @@ const {
   WSS_BURN_ONLY = '1',
   WSS_SKIP_NOISE = '1',
 
-  // ÚJ: ha 1 → bármilyen nem-LP növekmény esetén skip
+  // ha 1 → bármilyen nem-LP növekmény esetén skip
   STRICT_NO_NONLP_INCREASE = '1',
 } = process.env;
 
@@ -88,7 +88,8 @@ function extractBurns(tx){
     const post= tx?.meta?.postTokenBalances || [];
     const m = new Map(); for (const p of pre) m.set(p.accountIndex, p);
     for (const q of post){
-      const p = m.get(q.accountIndex); if (!p) continue;
+      const p = m.get(q.accountIndex);
+      if (!p) continue; // burnhez csökkenés kell, ehhez kell pre
       const dec = Number(q?.uiTokenAmount?.decimals ?? p?.uiTokenAmount?.decimals ?? 0);
       const preAmt  = Number(p?.uiTokenAmount?.amount || 0);
       const postAmt = Number(q?.uiTokenAmount?.amount || 0);
@@ -100,6 +101,8 @@ function extractBurns(tx){
   }catch(e){ dbg('extractBurns err:', e.message); }
   return burns;
 }
+
+// *** FIX: post-only (új ATA) növekmény felismerése ***
 function extractIncreases(tx){
   const incs=[];
   try{
@@ -107,9 +110,9 @@ function extractIncreases(tx){
     const post= tx?.meta?.postTokenBalances || [];
     const m = new Map(); for (const p of pre) m.set(p.accountIndex, p);
     for (const q of post){
-      const p = m.get(q.accountIndex); if (!p) continue;
+      const p = m.get(q.accountIndex);
       const dec = Number(q?.uiTokenAmount?.decimals ?? p?.uiTokenAmount?.decimals ?? 0);
-      const preAmt  = Number(p?.uiTokenAmount?.amount || 0);
+      const preAmt  = Number(p?.uiTokenAmount?.amount || 0);   // ha nincs pre → 0
       const postAmt = Number(q?.uiTokenAmount?.amount || 0);
       if (postAmt > preAmt) {
         const delta = (postAmt - preAmt) / Math.pow(10, dec);
@@ -119,6 +122,7 @@ function extractIncreases(tx){
   }catch(e){ dbg('extractIncreases err:', e.message); }
   return incs;
 }
+
 function getSigners(tx){
   try{
     const msg = tx?.transaction?.message;
@@ -196,7 +200,6 @@ function looksLikeRemoveLiquidity(tx, burns, increases){
   const nonLpIncs = (increases || []).filter(x => !lpMints.has(x.mint) && x.amount > 0);
   if (nonLpIncs.length >= 2) return true;
 
-  // signer + authority jelenlét
   const keys = tx?.transaction?.message?.accountKeys || [];
   const hasRayAuthInMsg = keys.some(k=>{
     const s = typeof k === 'string' ? k : k?.toBase58?.();
@@ -234,7 +237,7 @@ async function evaluateAndNotify(sig, tx) {
   // remove-liq klasszikus minták
   if (looksLikeRemoveLiquidity(tx, burns, incs)){ console.log('[skip]', sig, 'remove_liq_pattern'); return false; }
 
-  // ÚJ: ha be van kapcsolva, NINCS megengedett nem-LP növekmény
+  // NINCS megengedett nem-LP növekmény
   if (NO_NONLP) {
     const lpMints = new Set(burns.map(b => b.mint));
     const nonLpIncs = incs.filter(x => !lpMints.has(x.mint) && x.amount > 0);
