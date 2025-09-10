@@ -1,4 +1,5 @@
 // index.js — Raydium LP Burn watcher (ultra-low-noise + STRICT_RAYDIUM_PROG)
+// Teszt mód (node index.js <signature>) is végigfut a teljes szűrésen és posztol TG-re.
 //
 // Riasztás csak akkor:
 // 1) BurnChecked a logokban
@@ -33,7 +34,7 @@ const {
   WATCH_SPL_TOKEN_LEGACY = '0',
   WATCH_SPL_TOKEN_2022 = '0',
 
-  // ÚJ: ha 1 → kötelező Raydium program a message-ben; ha 0 → authority elég
+  // ha 1 → kötelező Raydium program a message-ben; ha 0 → authority elég
   STRICT_RAYDIUM_PROG = '1',
 } = process.env;
 
@@ -200,6 +201,71 @@ function maxBurnPct(burns){
   return maxPct;
 }
 
+// ===== Közös értékelés + TG küldés (éles + teszt ugyanazt használja) =====
+async function evaluateAndNotify(sig, tx) {
+  const logs = tx?.meta?.logMessages || [];
+
+  // 1) BurnChecked
+  if (!hasBurnChecked(logs)){
+    console.log('[skip]', sig, 'no_burnchecked');
+    return false;
+  }
+
+  // 2) (opcionális) Raydium program jelenlét
+  if (REQUIRE_RAYDIUM && !hasRaydiumProgramInMessage(tx)){
+    dbg('no raydium program (strict mode)');
+    console.log('[skip]', sig, 'no_raydium_program_strict');
+    return false;
+  }
+
+  // 3) zaj szűrés
+  if (hasNoise(logs)){
+    console.log('[skip]', sig, 'noise_keywords');
+    return false;
+  }
+
+  const burns=extractBurns(tx);
+  const incs =extractIncreases(tx);
+
+  // 4) remove-liq minta
+  if (looksLikeRemoveLiquidity(burns, incs)){
+    console.log('[skip]', sig, 'remove_liq_pattern');
+    return false;
+  }
+
+  // 5) authority check
+  const hit=await anyBurnMintHasKnownAuthority(burns);
+  if (!hit.ok){
+    console.log('[skip]', sig, 'no_authority_match');
+    return false;
+  }
+
+  // 6) min amount + pct
+  const totalUi=burns.reduce((s,b)=>s+b.amount,0);
+  if (totalUi < Number(MIN_BURN_UI||0)){
+    console.log('[skip]', sig, 'too_small');
+    return false;
+  }
+  const pct=maxBurnPct(burns);
+  if (pct < Number(MIN_LP_BURN_PCT||0.9)){
+    console.log('[skip]', sig, 'pct_too_low', pct.toFixed(3));
+    return false;
+  }
+
+  await autoLearnFromTx(tx);
+
+  // OK → TG
+  const byMint=new Map(); for(const b of burns) byMint.set(b.mint,(byMint.get(b.mint)||0)+b.amount);
+  let html = `<b>LP Burn Detected</b> ✅\n<b>Tx:</b> <code>${esc(sig)}</code>\n<b>Evidence:</b> authority${REQUIRE_RAYDIUM?'+raydium':''}+pct≥${Number(MIN_LP_BURN_PCT)}\n`;
+  for (const [mint,amt] of byMint.entries()){
+    html += `<b>LP Mint:</b> <code>${esc(mint)}</code>\n<b>Burned:</b> ${amt>=1?amt.toLocaleString('en-US',{maximumFractionDigits:4}):amt.toExponential(4)}\n`;
+  }
+  html += `<a href="https://solscan.io/tx/${encodeURIComponent(sig)}">Solscan</a>`;
+  await sendTG(html);
+  console.log('[ALERT]', sig);
+  return true;
+}
+
 // ===== Queue + limiter =====
 const RATE=Math.max(150, parseInt(RATE_MS,10)||1200);
 const sigQueue=[];
@@ -222,66 +288,8 @@ async function processQueue(){
     const tx=await connection.getTransaction(sig,{maxSupportedTransactionVersion:0, commitment:'confirmed'});
     if (!tx){ console.log('[skip] not_found', sig); return finish(); }
 
-    const logs=tx?.meta?.logMessages || [];
-
-    // 1) BurnChecked
-    if (!hasBurnChecked(logs)){
-      console.log('[skip]', sig, 'no_burnchecked');
-      return finish();
-    }
-
-    // 2) (opcionális) Raydium program jelenlét
-    if (REQUIRE_RAYDIUM && !hasRaydiumProgramInMessage(tx)){
-      dbg('no raydium program (strict mode)');
-      console.log('[skip]', sig, 'no_raydium_program_strict');
-      return finish();
-    }
-
-    // 3) zaj szűrés
-    if (hasNoise(logs)){
-      console.log('[skip]', sig, 'noise_keywords');
-      return finish();
-    }
-
-    const burns=extractBurns(tx);
-    const incs =extractIncreases(tx);
-
-    // 4) remove-liq minta
-    if (looksLikeRemoveLiquidity(burns, incs)){
-      console.log('[skip]', sig, 'remove_liq_pattern');
-      return finish();
-    }
-
-    // 5) authority check
-    const hit=await anyBurnMintHasKnownAuthority(burns);
-    if (!hit.ok){
-      console.log('[skip]', sig, 'no_authority_match');
-      return finish();
-    }
-
-    // 6) min amount + pct
-    const totalUi=burns.reduce((s,b)=>s+b.amount,0);
-    if (totalUi < Number(MIN_BURN_UI||0)){
-      console.log('[skip]', sig, 'too_small');
-      return finish();
-    }
-    const pct=maxBurnPct(burns);
-    if (pct < Number(MIN_LP_BURN_PCT||0.9)){
-      console.log('[skip]', sig, 'pct_too_low', pct.toFixed(3));
-      return finish();
-    }
-
-    await autoLearnFromTx(tx);
-
-    // OK → TG
-    const byMint=new Map(); for(const b of burns) byMint.set(b.mint,(byMint.get(b.mint)||0)+b.amount);
-    let html = `<b>LP Burn Detected</b> ✅\n<b>Tx:</b> <code>${esc(sig)}</code>\n<b>Evidence:</b> authority${REQUIRE_RAYDIUM?'+raydium':''}+pct≥${Number(MIN_LP_BURN_PCT)}\n`;
-    for (const [mint,amt] of byMint.entries()){
-      html += `<b>LP Mint:</b> <code>${esc(mint)}</code>\n<b>Burned:</b> ${amt>=1?amt.toLocaleString('en-US',{maximumFractionDigits:4}):amt.toExponential(4)}\n`;
-    }
-    html += `<a href="https://solscan.io/tx/${encodeURIComponent(sig)}">Solscan</a>`;
-    await sendTG(html);
-    console.log('[ALERT]', sig);
+    // közös értékelés + TG
+    await evaluateAndNotify(sig, tx);
 
   }catch(e){
     const m=String(e?.message||e);
@@ -293,7 +301,6 @@ async function processQueue(){
   }
 
   return finish();
-
   function finish(){
     setTimeout(()=>{ busy=false; if (sigQueue.length>0) processQueue(); }, RATE);
   }
@@ -316,10 +323,15 @@ async function subscribe(){
 
 // ===== Main =====
 (async function main(){
+  // --- TESZT MÓD: node index.js <signature>  → ugyanaz a pipeline + TG ---
   if (process.argv[2]) {
     const sig=process.argv[2];
     const tx =await connection.getTransaction(sig,{maxSupportedTransactionVersion:0, commitment:'confirmed'});
-    if (!tx){ console.error('Teszt tx nem található'); return; }
+    if (!tx){
+      console.error('Teszt tx nem található');
+      return;
+    }
+    // debug sorok, hogy lásd miért/miért nem menne át
     const logs=tx?.meta?.logMessages||[];
     console.log(
       'hasBurnChecked=', hasBurnChecked(logs),
@@ -330,6 +342,10 @@ async function subscribe(){
     console.log('looksRemoveLiq=', looksLikeRemoveLiquidity(burns,incs), 'maxBurnPct=', maxBurnPct(burns).toFixed(3));
     const hit=await anyBurnMintHasKnownAuthority(burns);
     console.log('authorityHit=', hit.ok, hit.authority||'');
+
+    // itt már NEM csak kiír — lefut a teljes értékelés és ha valid, TG-t is küld
+    const ok = await evaluateAndNotify(sig, tx);
+    console.log(ok ? '[test] ALERT sent' : '[test] not eligible');
     return;
   }
 
