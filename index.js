@@ -319,17 +319,27 @@ function connectWS(){
   if(!wsUrl){ console.error('Hiányzik RPC_WSS'); process.exit(1); }
   ws = new WebSocket(wsUrl);
   ws.on('open', ()=>{
-    connected = true;
-    console.log('[INFO] WebSocket opened:', wsUrl);
+  connected = true;
+  console.log('[INFO] WebSocket opened:', wsUrl);
 
-    const programs = buildProgramSubscribeList();
-    const sub = {
-      jsonrpc:'2.0', id:1, method:'transactionSubscribe',
-      params:[{ accounts:{ any: programs }, commitment:'confirmed' }]
-    };
-    ws.send(JSON.stringify(sub));
-    console.log('[INFO] Feliratkozás elküldve ezekre a programokra:', programs.join(', '));
-  });
+  const programs = buildProgramSubscribeList(); // Raydium + Token(ek) ENV szerint
+  const sub = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'transactionSubscribe',
+    params: [{
+      // <<< KULCS VÁLTÁS: accounts.any -> mentions >>>
+      mentions: programs,
+      commitment: 'confirmed',
+      // ezek segítenek, hogy teljes adatot kapjunk
+      encoding: 'jsonParsed',
+      maxSupportedTransactionVersion: 0
+    }]
+  };
+
+  ws.send(JSON.stringify(sub));
+  console.log('[INFO] Feliratkozás elküldve ezekre a programokra:', programs.join(', '));
+});
   ws.on('message', (buf)=>{
     let m; try{ m=JSON.parse(buf.toString()); } catch{ return; }
     if (m.method==='transactionNotification'){
