@@ -1,9 +1,5 @@
-// index.js — LP Burn watcher (ALL-LP + PURE BURN mód)
-// - ALL_LP_BROAD=1 → SPL Token programokra is feliratkozik → minden DEX LP burn jön
-// - PURE_BURN_ONLY=1 → csak akkor alert, ha a tx-ben CSAK LP csökkenés van,
-//   nincs más tokennél változás és nincs SPL Transfer/MintTo (zajmentes)
-// - REQUIRE_AUTH_MATCH=1 → csak ismert (tanult) authority-khez tartozó LP mints esetén jelez
-// - EXTRA_PROGRAM_IDS=... → tetszőleges további programID-ket adhatsz előszűréshez
+// index.js — Universal LP Burn watcher (PURE mode + ALL-LP + Rich TG)
+// Telegram üzenet: Token name, Token address, Mcap, Liquidity, Token/Pool creation, Freeze mint, Dexscreener link
 
 import 'dotenv/config';
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -28,21 +24,21 @@ const {
   WATCH_RAYDIUM_CLMM = '0',
   WATCH_SPL_TOKEN_LEGACY = '1',
   WATCH_SPL_TOKEN_2022 = '1',
-  EXTRA_PROGRAM_IDS = '',            // vesszővel elválasztott lista
+  EXTRA_PROGRAM_IDS = '',
 
   // all-LP mód
-  ALL_LP_BROAD = '0',                // 1 → a fókusz a token programokon
-  REQUIRE_AUTH_MATCH = '0',          // 1 → csak ismert authority esetén alert
+  ALL_LP_BROAD = '1',               // 1 → SPL Token programokra is feliratkozunk (minden DEX)
+  REQUIRE_AUTH_MATCH = '0',         // 1 → csak ismert authority-k
 
-  // strict Raydium (opcionális)
+  // Raydium strict (opcionális)
   STRICT_RAYDIUM_PROG = '0',
 
-  // WSS előszűrő (terheléscsökkentés)
+  // WSS előszűrő
   WSS_PREFILTER = '1',
   WSS_BURN_ONLY = '1',
   WSS_SKIP_NOISE = '1',
 
-  // remove-liq ellen őr
+  // remove-liq ellen
   STRICT_NO_NONLP_INCREASE = '1',
 
   // zajmentes mód
@@ -66,7 +62,7 @@ const REQUIRE_AUTH = String(REQUIRE_AUTH_MATCH) === '1';
 
 const NOISE_KEYWORDS = ['swap','route','jupiter','aggregator','meteora','goonfi','phoenix','openbook'];
 
-// ===== Program IDs (Raydium docs + SPL token) =====
+// ===== Program IDs =====
 const RAYDIUM_AMM_V4_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 const RAYDIUM_CPMM_ID   = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
 const RAYDIUM_CLMM_ID   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
@@ -74,32 +70,45 @@ const RAYDIUM_CLMM_ID   = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
 const SPL_TOKEN_LEGACY_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const SPL_TOKEN_2022_ID   = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 
-// Raydium mint authority V4 (tanulás seedje)
 const RAYDIUM_AUTHORITY_V4 = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1';
+const WSOL = 'So11111111111111111111111111111111111111112';
 
 // ===== Helpers =====
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 function safePk(s){ try{ return new PublicKey(String(s).trim()); }catch{ console.error('⚠️ Invalid program id:', s); return null; } }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+function fmtUSD(x){
+  if (x == null) return '—';
+  const n = Number(x);
+  if (!isFinite(n)) return '—';
+  if (n >= 1e9) return `$${(n/1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `$${(n/1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `$${(n/1e3).toFixed(2)}k`;
+  return `$${n.toFixed(2)}`;
+}
+function fmtDate(ts){
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return d.toISOString().replace('T',' ').replace('.000Z',' UTC');
+}
+
 function buildPrograms(){
-  // Minden LP mód: mindig vegyük fel a SPL Token(eke)t — itt keletkezik a BurnChecked log.
   const list=[];
+  // ALL-LP → mindenképp SPL token programok
   if (BROAD || String(WATCH_SPL_TOKEN_LEGACY)==='1') list.push(SPL_TOKEN_LEGACY_ID);
   if (BROAD || String(WATCH_SPL_TOKEN_2022)==='1')   list.push(SPL_TOKEN_2022_ID);
 
-  // Jöhetnek Raydium progok is (csak előszűrés javítására, nem szükséges)
+  // Raydium fókusz (ha nem BROAD)
   if (!BROAD) {
     if (String(WATCH_RAYDIUM_AMM)==='1')  list.push(RAYDIUM_AMM_V4_ID);
     if (String(WATCH_RAYDIUM_CPMM)==='1') list.push(RAYDIUM_CPMM_ID);
     if (String(WATCH_RAYDIUM_CLMM)==='1') list.push(RAYDIUM_CLMM_ID);
   }
 
-  // EXTRA_PROGRAM_IDS: pl. egyedi AMM-ek
   if (EXTRA_PROGRAM_IDS && EXTRA_PROGRAM_IDS.trim().length){
     EXTRA_PROGRAM_IDS.split(',').map(s=>s.trim()).filter(Boolean).forEach(id=>list.push(id));
   }
-  // duplikátumok kiszórása
   return [...new Set(list)].map(safePk).filter(Boolean);
 }
 
@@ -108,7 +117,7 @@ async function sendTG(html){
   try{
     const r=await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`,{
       method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: html, parse_mode:'HTML', disable_web_page_preview:true })
+      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: html, parse_mode:'HTML', disable_web_page_preview:false })
     });
     if (!r.ok) console.error('Telegram error:', r.status, await r.text());
   }catch(e){ console.error('Telegram send failed:', e.message); }
@@ -135,7 +144,6 @@ function extractBurns(tx){
   }catch(e){ dbg('extractBurns err:', e.message); }
   return burns;
 }
-
 function extractIncreases(tx){
   const incs=[];
   try{
@@ -155,7 +163,6 @@ function extractIncreases(tx){
   }catch(e){ dbg('extractIncreases err:', e.message); }
   return incs;
 }
-
 function getSigners(tx){
   try{
     const msg = tx?.transaction?.message;
@@ -172,16 +179,27 @@ function getSigners(tx){
 
 // authority cache + learning
 const mintAuthCache=new Map();
-async function fetchMintAuthority(mint){
-  if (mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
+async function fetchMintAccountParsed(mint){
   try{
     const body={jsonrpc:'2.0',id:'mint',method:'getAccountInfo',params:[mint,{encoding:'jsonParsed',commitment:'confirmed'}]};
     const r=await fetch(RPC_HTTP,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
     const j=await r.json();
-    const auth=j?.result?.value?.data?.parsed?.info?.mintAuthority ?? null;
+    return j?.result?.value || null;
+  }catch(e){ return null; }
+}
+async function fetchMintAuthority(mint){
+  if (mintAuthCache.has(mint)) return mintAuthCache.get(mint).authority;
+  try{
+    const val = await fetchMintAccountParsed(mint);
+    const auth=val?.data?.parsed?.info?.mintAuthority ?? null;
     mintAuthCache.set(mint,{authority:auth,when:Date.now()});
     return auth;
   }catch(e){ return null; }
+}
+async function fetchMintFreezeOnOff(mint){
+  const val = await fetchMintAccountParsed(mint);
+  const freeze = val?.data?.parsed?.info?.freezeAuthority ?? null;
+  return !!freeze;
 }
 const AUTH_FILE='./raydium_authorities.json';
 let learned=new Set([RAYDIUM_AUTHORITY_V4]);
@@ -306,19 +324,86 @@ function isPureBurn(tx, burns) {
   }
 }
 
+// ===== DexScreener + Token info helpers =====
+async function fetchDexScreenerTopPair(tokenMint){
+  try{
+    const url = `https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const pairs = j?.pairs || [];
+    if (!pairs.length) return null;
+    // Válasszuk a legnagyobb liquidity-t
+    pairs.sort((a,b)=> (b?.liquidity?.usd||0) - (a?.liquidity?.usd||0));
+    return pairs[0];
+  }catch(e){ return null; }
+}
+
+// On-chain mint creation time (becslés): a legkorábbi ismert tx időpontja
+async function fetchMintCreationTime(mint){
+  try{
+    let before = undefined;
+    let oldest = null;
+    for (let i=0;i<5;i++){ // max ~500 tx-t néz vissza
+      const body = {
+        jsonrpc:'2.0', id:`sig_${i}`,
+        method:'getSignaturesForAddress',
+        params: [ mint, { limit: 100, before } ]
+      };
+      const r = await fetch(RPC_HTTP,{ method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+      const j = await r.json();
+      const arr = j?.result || [];
+      if (!arr.length) break;
+      oldest = arr[arr.length-1];
+      before = oldest.signature;
+      if (arr.length < 100) break;
+    }
+    if (!oldest) return null;
+    // blockTime lekérése
+    const btReq = { jsonrpc:'2.0', id:'bt', method:'getBlockTime', params:[ oldest.slot ] };
+    const br = await fetch(RPC_HTTP,{ method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(btReq) });
+    const bj = await br.json();
+    const bt = bj?.result;
+    if (!bt) return null;
+    return new Date(bt*1000).toISOString();
+  }catch(e){ return null; }
+}
+
+// Base token felderítése a tx accountKey-jei között (mint típusú accountok)
+async function findCandidateBaseTokenMint(tx, burnLpMints){
+  try{
+    const keys = tx?.transaction?.message?.accountKeys || [];
+    const seen = new Set();
+    for (const k of keys){
+      const addr = typeof k==='string' ? k : k?.toBase58?.();
+      if (!addr || seen.has(addr)) continue;
+      seen.add(addr);
+      if (burnLpMints.has(addr)) continue;
+      if (addr === WSOL) continue;
+
+      // getAccountInfo parsed – ha "mint" típus, akkor jelölt
+      const info = await fetchMintAccountParsed(addr);
+      const parsedType = info?.data?.parsed?.type;
+      if (parsedType === 'mint'){
+        return addr; // első reális jelöltet visszaadjuk
+      }
+    }
+  }catch(e){}
+  return null;
+}
+
 // ===== Értékelés + TG =====
 async function evaluateAndNotify(sig, tx) {
   const logs = tx?.meta?.logMessages || [];
 
   if (!hasBurnChecked(logs)){ console.log('[skip]', sig, 'no_burnchecked'); return false; }
 
-  // PURE BURN már itt
   const burns = extractBurns(tx);
+
   if (PURE_ONLY && !isPureBurn(tx, burns)) {
     console.log('[skip]', sig, 'not_pure_burn');
     return false;
   }
-
   if (REQUIRE_RAYDIUM && !hasRaydiumProgramInMessage(tx)){ console.log('[skip]', sig, 'no_raydium_program_strict'); return false; }
   if (hasNoise(logs)){ console.log('[skip]', sig, 'noise_keywords'); return false; }
 
@@ -338,7 +423,6 @@ async function evaluateAndNotify(sig, tx) {
     const hit=await anyBurnMintHasKnownAuthority(burns);
     if (!hit.ok){ console.log('[skip]', sig, 'no_authority_match'); return false; }
   } else {
-    // fakultatív auto-learn bármely mint authority-jét ismeretbővítéshez
     await autoLearnFromTx(tx);
   }
 
@@ -347,13 +431,77 @@ async function evaluateAndNotify(sig, tx) {
   const pct=maxBurnPct(burns);
   if (pct < Number(MIN_LP_BURN_PCT||0.9)){ console.log('[skip]', sig, 'pct_too_low', pct.toFixed(3)); return false; }
 
-  const byMint=new Map(); for(const b of burns) byMint.set(b.mint,(byMint.get(b.mint)||0)+b.amount);
-  let html = `<b>LP Burn Detected</b> ✅\n<b>Tx:</b> <code>${esc(sig)}</code>\n<b>Mode:</b> ${BROAD?'ALL-LP':'Raydium-focused'} | ${PURE_ONLY?'PURE':''}${REQUIRE_AUTH?' +AUTH':''}\n`;
-  for (const [mint,amt] of byMint.entries()){
-    html += `<b>LP Mint:</b> <code>${esc(mint)}</code>\n<b>Burned:</b> ${amt>=1?amt.toLocaleString('en-US',{maximumFractionDigits:4}):amt.toExponential(4)}\n`;
+  // ===== Részletes token/pool info összeszedése =====
+  const lpMintSet = new Set(burns.map(b=>b.mint));
+  // base token jelölt keresése
+  let baseMint = await findCandidateBaseTokenMint(tx, lpMintSet);
+  // ha nincs jelölt, utolsó esély: próbálkozzunk még 1-2 account-tal a pre/post listából (ritka eset)
+  if (!baseMint){
+    const allMints = new Set([
+      ...lpMintSet,
+      ...(tx?.meta?.preTokenBalances||[]).map(x=>x.mint),
+      ...(tx?.meta?.postTokenBalances||[]).map(x=>x.mint),
+    ].filter(Boolean));
+    for (const m of allMints){
+      if (m!==WSOL && !lpMintSet.has(m)){
+        const info = await fetchMintAccountParsed(m);
+        if (info?.data?.parsed?.type === 'mint'){ baseMint = m; break; }
+      }
+    }
   }
-  html += `<a href="https://solscan.io/tx/${encodeURIComponent(sig)}">Solscan</a>`;
-  await sendTG(html);
+
+  // Freeze mint (LP-n)
+  let freezeOn = false;
+  // ha több LP mint van, bármelyikre igaz → On
+  for (const m of lpMintSet){
+    const fo = await fetchMintFreezeOnOff(m);
+    if (fo) { freezeOn = true; break; }
+  }
+
+  // DexScreener adat (base tokenhez)
+  let ds = null;
+  if (baseMint) ds = await fetchDexScreenerTopPair(baseMint);
+
+  // Token creation time (base token)
+  let tokenCreatedISO = null;
+  if (baseMint) tokenCreatedISO = await fetchMintCreationTime(baseMint);
+
+  // Pool creation time
+  const poolCreatedISO = ds?.createdAt ? new Date(ds.createdAt).toISOString() : null;
+
+  // Token name/symbol
+  const tokenName = ds?.baseToken?.name || 'Unknown';
+  const tokenSym  = ds?.baseToken?.symbol || '';
+  const tokenAddr = baseMint || [...lpMintSet][0];
+
+  const mcap = ds?.marketCap ?? ds?.fdv ?? null;
+  const liq  = ds?.liquidity?.usd ?? null;
+
+  // ===== TG üzenet (HTML) =====
+  const byMint=new Map(); for(const b of burns) byMint.set(b.mint,(byMint.get(b.mint)||0)+b.amount);
+  let burnedLines = '';
+  for (const [mint,amt] of byMint.entries()){
+    burnedLines += `• <code>${esc(mint)}</code> — ${amt>=1?amt.toLocaleString('en-US',{maximumFractionDigits:4}):amt.toExponential(4)} LP\n`;
+  }
+
+  const tg =
+`🔥 <b>LP Burn Detected</b>
+<b>Tx:</b> <a href="https://solscan.io/tx/${encodeURIComponent(sig)}">${esc(sig.slice(0,8))}…</a>
+
+<b>Token:</b> ${esc(tokenName)}${tokenSym?` (${esc(tokenSym)})`:''}
+<b>Token Address:</b> <code>${esc(tokenAddr)}</code>
+<b>Mcap:</b> ${fmtUSD(mcap)}
+<b>Liquidity:</b> ${fmtUSD(liq)}
+<b>Token Created:</b> ${tokenCreatedISO ? fmtDate(new Date(tokenCreatedISO)) : '—'}
+<b>Pool Created:</b> ${poolCreatedISO ? fmtDate(new Date(poolCreatedISO)) : '—'}
+<b>Freeze Mint:</b> ${freezeOn ? 'On' : 'Off'}
+
+<b>Burned LP mints:</b>
+${burnedLines.trim()}
+
+🔗 <a href="https://dexscreener.com/solana/${encodeURIComponent(tokenAddr)}">DexScreener</a>`;
+
+  await sendTG(tg);
   console.log('[ALERT]', sig);
   return true;
 }
