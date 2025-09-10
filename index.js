@@ -1,9 +1,5 @@
 // index.js — Raydium LP burn watcher
-// WS + Test mód + részletes REASON log
-// LP burn akkor megy át, ha:
-//   - mintAuthority ∈ Raydium Authority (V2/V3/V4)  ➜ KÖTELEZŐ
-//   - + (opcionálisan) Raydium programnyom a tx-ben (REQUIRE_RAYDIUM_PROGRAM)
-// Védelmek: MIN_BURN_UI, SKIP_MINTS, SKIP_SIGNATURES, underlying növekmény szűrés, (opcionális) incinerator
+// WS + Test mód + részletes REASON log + Folyamatos PROGRESS log Render konzolra
 
 import 'dotenv/config';
 import WebSocket from 'ws';
@@ -21,7 +17,7 @@ const {
   RAYDIUM_AUTHORITIES = '',
   AUTO_LEARN_AUTHORITIES = '1',
 
-  // <<< ÚJ >>> ha 1: KELL Raydium programnyom is; ha 0: authority-only is jó
+  // ha 1: KELL Raydium programnyom is; ha 0: authority-only is jó
   REQUIRE_RAYDIUM_PROGRAM = '0',
 
   // finomhangolás / védelem
@@ -31,6 +27,9 @@ const {
   MIN_BURN_UI = '0',
   SKIP_SIGNATURES = '',
   SKIP_MINTS = '',
+
+  // <<< ÚJ >>> folyamatos progress log
+  PROGRESS_LOG = '1',
 } = process.env;
 
 // Raydium AMM/CPMM programok
@@ -48,6 +47,8 @@ const INCINERATOR = '1nc1nerator11111111111111111111111111111111';
 const SKIP_KEYWORDS = ['remove', 'remove_liquidity', 'withdraw', 'remove-liquidity'];
 
 const logDbg = (...a) => { if (String(DEBUG) === '1') console.log('[DBG]', ...a); };
+const logProg = (...a) => { if (String(PROGRESS_LOG) === '1') console.log('[PROG]', ...a); };
+
 const wsUrl = RPC_WSS;
 const httpUrl = RPC_HTTP;
 
@@ -141,22 +142,28 @@ async function fetchMintAuthority(mint) {
     const j = await res.json();
     const authority = j?.result?.value?.data?.parsed?.info?.mintAuthority ?? null;
     mintAuthCache.set(mint, { authority, when: Date.now() });
-    logDbg('mintAuthority', mint, '→', authority);
     return authority;
   } catch (e) { logDbg('fetchMintAuthority err:', e.message); return null; }
 }
 
-async function anyBurnMintHasKnownAuthority(burns) {
+async function anyBurnMintHasKnownAuthority(burns, sigForLog) {
+  const auths = [];
   for (const b of burns) {
-    if (SKIP_MINT_SET.has(b.mint)) return { ok:false, authority: null, skippedMint: b.mint };
+    if (SKIP_MINT_SET.has(b.mint)) return { ok:false, authority: null, skippedMint: b.mint, auths };
     const auth = await fetchMintAuthority(b.mint);
-    if (auth && learnedAuth.has(auth)) return { ok:true, authority: auth };
+    auths.push({ mint: b.mint, authority: auth });
+    if (auth && learnedAuth.has(auth)) {
+      // progress: amint hit van, logoljuk a teljes listát is
+      logProg('AUTH', sigForLog, JSON.stringify(auths));
+      return { ok:true, authority: auth, auths };
+    }
   }
-  return { ok:false };
+  logProg('AUTH', sigForLog, JSON.stringify(auths));
+  return { ok:false, auths };
 }
 
 // Tanulás: CSAK akkor tanulunk authority-t, ha Raydium programnyom is van
-async function learnAuthoritiesFromTx(tx) {
+async function learnAuthoritiesFromTx(tx, sigForLog) {
   if (String(AUTO_LEARN_AUTHORITIES) !== '1') return;
   if (!includesRaydium(tx)) return;
   const burns = extractBurns(tx);
@@ -164,8 +171,8 @@ async function learnAuthoritiesFromTx(tx) {
     const auth = await fetchMintAuthority(b.mint);
     if (auth && !learnedAuth.has(auth)) {
       learnedAuth.add(auth);
-      persistLearned();
-      console.log(`LEARNED authority=${auth} mint=${b.mint}`);
+      try { fs.writeFileSync(AUTH_FILE, JSON.stringify([...learnedAuth], null, 2)); } catch {}
+      logProg('LEARNED', sigForLog, `authority=${auth} mint=${b.mint}`);
     }
   }
 }
@@ -199,26 +206,32 @@ async function whyNotPureLPBurn(tx) {
   if (burns.length === 0) return { ok:false, reason:'no_lp_delta' };
   if (totalBurnUi(burns) < Number(MIN_BURN_UI)) return { ok:false, reason:'too_small_burn' };
 
-  // Kötelező: Raydium authority találat legalább egy burnölt minner
-  const authHit = await anyBurnMintHasKnownAuthority(burns);
+  // PROGRESS: alap adatok
+  logProg('CHECK', sig, `at=${new Date().toISOString()}`);
+  logProg('MINTS', sig, JSON.stringify(burns.map(b=>b.mint)));
+
+  // authority – kötelező
+  const authHit = await anyBurnMintHasKnownAuthority(burns, sig);
   if (!authHit.ok) return { ok:false, reason:'no_raydium_authority' };
 
-  // Programnyom – csak ha kérjük
+  // programnyom – csak ha kérjük
   const hasProg = includesRaydium(tx);
+  logProg('PROGRAM', sig, `present=${hasProg}`);
   if (String(REQUIRE_RAYDIUM_PROGRAM) === '1' && !hasProg) {
     return { ok:false, reason:'no_raydium_program' };
   }
 
-  // Incinerator (opcionális, nagyon szigorú)
+  // Incinerator (opcionális)
   const viaIncin = JSON.stringify(tx).includes(INCINERATOR);
   if (String(REQUIRE_INCINERATOR) === '1' && !viaIncin) {
     return { ok:false, reason:'incinerator_required' };
   }
 
-  // Underlying növekmények szűrése
+  // Underlying növekmény szűrés
   const agg = analyzeUnderlyingMovements(tx);
   const eps = Number(UNDERLYING_UP_EPS);
   const ups = Object.values(agg).filter(v => v > eps).length;
+  logProg('UNDERLYING', sig, JSON.stringify(agg));
   if (ups > Number(MAX_UNDERLYING_UP_MINTS) && !viaIncin) {
     return { ok:false, reason:'underlying_growth_without_incin', details:{ups} };
   }
@@ -243,10 +256,18 @@ function connectWS(){
     if (m.method==='transactionNotification'){
       const tx = m?.params?.result?.transaction || m?.params?.result;
       const sig = tx?.transaction?.signatures?.[0] || '';
-      await learnAuthoritiesFromTx(tx); // csak programnyom esetén tanul
+
+      // PROGRESS: melyik tx érkezett
+      logProg('RX', sig);
+
+      // tanulás (csak programnyom esetén tanul)
+      await learnAuthoritiesFromTx(tx, sig);
 
       const check = await whyNotPureLPBurn(tx);
-      if (!check.ok) { console.log(`SKIP ${sig} reason=${check.reason}`); return; }
+      if (!check.ok) {
+        console.log(`SKIP ${sig} reason=${check.reason}`);
+        return;
+      }
       const text = buildMsg(tx, check);
       await sendToTG(text);
       console.log(`ALERT ${sig} reason=${check.reason} evidence=${check.raydiumEvidence}`);
@@ -266,12 +287,19 @@ async function testSignature(sig){
     const j=await res.json(); const tx=j?.result;
     if(!tx){ console.error('Nem találtam tranzakciót ehhez a signature-höz.'); console.error(j); return; }
     const burns=extractBurns(tx);
+    logProg('CHECK', sig, `at=${new Date().toISOString()}`);
+    logProg('MINTS', sig, JSON.stringify(burns.map(b=>b.mint)));
+    const auths=[];
     for(const b of burns){
       const auth=await fetchMintAuthority(b.mint);
-      console.log(`mint=${b.mint} authority=${auth||'null'}`);
+      auths.push({mint:b.mint, authority:auth||'null'});
     }
+    logProg('AUTH', sig, JSON.stringify(auths));
     const hasProg = includesRaydium(tx);
-    console.log('raydium_program_present=', hasProg);
+    logProg('PROGRAM', sig, `present=${hasProg}`);
+    const agg=analyzeUnderlyingMovements(tx);
+    logProg('UNDERLYING', sig, JSON.stringify(agg));
+
     const check=await whyNotPureLPBurn(tx);
     console.log(`TEST ${sig} looksLikePureLPBurn=${check.ok} reason=${check.reason} evidence=${check.raydiumEvidence||''}`);
     if(check.ok){ const text=buildMsg(tx, check); await sendToTG(text); console.log('Teszt üzenet elküldve TG-re.'); }
