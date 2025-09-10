@@ -1,33 +1,40 @@
-// index.js — LP-only burn watcher (STRICT): authority whitelist + (optional) LP program context + PURE burn
+// index.js — LP-only burn watcher (STRICT by default)
+// - LP-only = mintAuthority whitelist (Raydium V4 by default)
+// - Optional LP program context check (soft fallback if authority whitelisted)
+// - Pure Burn only (no swap/transfer/noise, no remove-liquidity patterns)
+// - SPL Token Program onLogs subscription (low credits, stabil)
 
 import 'dotenv/config';
 import { Connection, PublicKey } from '@solana/web3.js';
 import fetch from 'node-fetch';
 
-// ===== ENV =====
+// ================== ENV ==================
 const {
   RPC_HTTP, RPC_WSS,
   TG_BOT_TOKEN, TG_CHAT_ID,
 
   RATE_MS = '1200',
-  MIN_BURN_UI = '0',           // minimum össz-UI burn méret (LP mint(ek) összeadva)
+  MIN_BURN_UI = '0',           // min össz-UI burn (LP mint(ek) összeadva)
   MIN_LP_BURN_PCT = '0.90',    // min. arány (pre->post csökkenés) az LP mint(ek)re
 
   DEBUG = '0',
   LOG_ALL_TX = '0',
 
-  // Pure + zaj-szűrés (feliratkozási előszűrő és elemzéskor is)
-  WSS_PREFILTER = '1',
-  WSS_BURN_ONLY = '1',
-  WSS_SKIP_NOISE = '1',
-  PURE_BURN_ONLY = '1',
-  STRICT_NO_NONLP_INCREASE = '1',
+  // Feliratkozás előszűrő
+  WSS_PREFILTER = '1',         // előszűrés onLogs-ban
+  WSS_BURN_ONLY = '1',         // csak Burn/BurnChecked logok maradnak
+  WSS_SKIP_NOISE = '1',        // swap/route/jupiter stb. zaj kidobása
+
+  // Elemzéskori szűrések
+  PURE_BURN_ONLY = '1',            // csak pure LP burn mehet át
+  STRICT_NO_NONLP_INCREASE = '1',  // nem-LP token nem nőhet
 
   // LP-only követelmények
   REQUIRE_LP_AUTH = '1',         // KÖTELEZŐ: mintAuthority whitelist
   KNOWN_LP_AUTHORITIES = '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Raydium V4
 
-  REQUIRE_LP_PROGRAM = '1',      // Opcionális: tx accountKeys között legyen LP program
+  // LP program kontextus (SOFT fallback)
+  REQUIRE_LP_PROGRAM = '0', // 0 = kikapcsolva; 1 = soft: ha nincs kontextus, de authority whitelistes, engedjük
   KNOWN_LP_PROGRAM_IDS = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8,CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C,CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium AMM/CPMM/CLMM
 
 } = process.env;
@@ -65,10 +72,10 @@ const KNOWN_LP_PROGRAMS = new Set(
     .filter(Boolean)
 );
 
-// zajkulcsszavak
+// zaj kulcsszavak
 const NOISE = ['swap','route','jupiter','aggregator','meteora','goonfi','phoenix','openbook'];
 
-// ===== Helpers =====
+// ================== Helpers ==================
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
@@ -76,8 +83,14 @@ async function sendTG(html){
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   try{
     const r = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-      method: 'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: html, parse_mode: 'HTML', disable_web_page_preview: false })
+      method: 'POST',
+      headers:{'content-type':'application/json'},
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text: html,
+        parse_mode: 'HTML',
+        disable_web_page_preview: false
+      })
     });
     if (!r.ok) console.error('Telegram error:', r.status, await r.text());
   }catch(e){ console.error('Telegram send failed:', e.message); }
@@ -134,7 +147,7 @@ function extractIncreases(tx){
 function isPureBurn(tx, burns){
   try{
     const logs = tx?.meta?.logMessages || [];
-    // tiltjuk a Transfer/MintTo jellegű SPL token műveleteket
+    // SPL Transfer/MintTo => nem pure
     const transferLike = (logs || []).some(l => /Instruction:\s*Transfer|Instruction:\s*MintTo/i.test(l));
     if (transferLike) return false;
 
@@ -143,7 +156,7 @@ function isPureBurn(tx, burns){
     const lpSet = new Set(burns.map(b=>b.mint));
     if (lpSet.size === 0) return false;
 
-    // csak LP csökkenhet; bármely más token változása kizáró ok
+    // csak LP csökkenhet; minden más token változása kizáró ok
     const mapPre = new Map(pre.map(p=>[p.accountIndex,p]));
     let anyLpDec=false;
 
@@ -161,6 +174,7 @@ function isPureBurn(tx, burns){
       }
     }
 
+    // eltűnt accountok kezelése
     const postIdx = new Set(post.map(x=>x.accountIndex));
     for (const p of pre){
       if (!postIdx.has(p.accountIndex)){
@@ -223,42 +237,51 @@ function looksLikeRemoveLiquidity(tx, burns, increases){
   return false;
 }
 
-// ===== Értékelés + TG =====
+// ================== Értékelés + TG ==================
 async function evaluateAndNotify(sig, tx){
   const logs = tx?.meta?.logMessages || [];
   if (!hasBurnChecked(logs)) { dbg('no burnchecked', sig); return false; }
   if (PREFILTER_SKIP_NOISE && hasNoise(logs)) { dbg('noise', sig); return false; }
 
-  // LP-only feltétel #1: PURE burn
+  // LP-only #1: PURE burn
   const burns = extractBurns(tx);
   if (PURE_ONLY && !isPureBurn(tx, burns)) { dbg('not pure burn', sig); return false; }
 
-  // LP-only feltétel #2: ne legyen remove-liq mintázat
+  // LP-only #2: ne legyen remove-liq minta
   const incs = extractIncreases(tx);
   if (looksLikeRemoveLiquidity(tx, burns, incs)) { dbg('remove-liq pattern', sig); return false; }
 
-  // LP-only feltétel #3: nincs nem-LP növekedés
+  // LP-only #3: nincs nem-LP növekedés
   if (NO_NONLP) {
     const lp = new Set(burns.map(b=>b.mint));
     const nonLpIncs = incs.filter(x => !lp.has(x.mint) && x.amountUI > 0);
     if (nonLpIncs.length>0) { dbg('non-LP incs', sig); return false; }
   }
 
-  // LP-only feltétel #4: minden égetett mint authority-ja whitelistes
+  // LP-only #4: minden égetett mint authority-ja whitelistes
+  let allAuthWhitelisted = true;
   if (REQUIRE_AUTH) {
     for (const b of burns) {
       const auth = await getMintAuthority(b.mint);
       if (!auth || !AUTH_WHITELIST.has(auth)) {
+        allAuthWhitelisted = false;
         dbg('auth not whitelisted', b.mint, '->', auth);
-        return false; // SIMA token burn itt kiesik
+        break;
       }
     }
+    if (!allAuthWhitelisted) return false; // SIMA token burn itt kiesik
   }
 
-  // LP-only feltétel #5: (opcionális) legyen LP program kontextus is
-  if (REQUIRE_PROG && !hasKnownProgramContext(tx)) {
-    dbg('no known LP program context', sig);
-    return false;
+  // LP-only #5: LP program kontextus (SOFT) — ha nincs, de authority whitelistes, engedjük
+  if (REQUIRE_PROG) {
+    const hasProg = hasKnownProgramContext(tx);
+    if (!hasProg) {
+      if (!allAuthWhitelisted) {
+        dbg('no LP program context and authority not whitelisted -> drop', sig);
+        return false;
+      }
+      dbg('no LP program context, but authority whitelisted -> allow', sig);
+    }
   }
 
   // további határértékek
@@ -282,7 +305,7 @@ async function evaluateAndNotify(sig, tx){
   }
 
   const html =
-`🔥 <b>LP Burn Detected</b> (STRICT)
+`🔥 <b>LP Burn Detected</b>
 <b>Tx:</b> <a href="https://solscan.io/tx/${encodeURIComponent(sig)}">${esc(sig.slice(0,8))}…</a>
 
 <b>Freeze Mint:</b> ${hasFreeze ? 'On' : 'Off'}
@@ -290,13 +313,12 @@ async function evaluateAndNotify(sig, tx){
 ${lines.trim()}
 
 🔗 <a href="https://dexscreener.com/solana/${encodeURIComponent([...byMint.keys()][0])}">DexScreener</a>`;
-
   await sendTG(html);
   console.log('[ALERT]', sig);
   return true;
 }
 
-// ===== Queue & limiter =====
+// ================== Queue & limiter ==================
 const sigQueue=[]; let busy=false, lastSig='-';
 function enqueue(sig, prog){ if (String(LOG_ALL_TX)==='1') console.log('[rx]', sig, 'via', prog); sigQueue.push({sig, prog}); processQueue(); }
 async function processQueue(){
@@ -318,11 +340,11 @@ async function processQueue(){
 }
 setInterval(()=>console.log(`[hb] queue=${sigQueue.length} lastSig=${lastSig}`), 10000);
 
-// ===== Subscribe (SPL token programokra, előszűrővel) =====
+// ================== Subscribe (SPL Token programs) ==================
 function programList(){
-  // SPL Token programok – ezeken jönnek a Burn/BurnChecked logok
+  // SPL Token programok: ezek alatt jönnek a Burn/BurnChecked logok
   return [
-    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',       // legacy
+    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',       // legacy token program
     'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',       // token-2022
   ].map(s=>new PublicKey(s));
 }
@@ -331,7 +353,7 @@ async function subscribe(){
   const pks = programList();
   console.log('[info] onLogs subscribe SPL token programs | RATE_MS=', RATE,
               '| PREFILTER=', PREFILTER, '| PURE_BURN_ONLY=', PURE_ONLY,
-              '| REQUIRE_LP_AUTH=', REQUIRE_AUTH, '| REQUIRE_LP_PROGRAM=', REQUIRE_PROG);
+              '| REQUIRE_LP_AUTH=', REQUIRE_AUTH, '| REQUIRE_LP_PROGRAM(soft)=', REQUIRE_PROG);
 
   for (const pk of pks){
     await connection.onLogs(pk, (ev)=>{
@@ -349,9 +371,9 @@ async function subscribe(){
   }
 }
 
-// ===== Main =====
+// ================== Main ==================
 (async function main(){
-  // Teszt: node index.js <signature>
+  // Teszt mód: node index.js <signature>
   if (process.argv[2]) {
     const sig=process.argv[2];
     const tx=await connection.getTransaction(sig,{maxSupportedTransactionVersion:0, commitment:'confirmed'});
@@ -365,6 +387,6 @@ async function subscribe(){
   console.log('LP Burn watcher starting…',
     '| PURE_ONLY=', PURE_ONLY?'ON':'OFF',
     '| REQUIRE_LP_AUTH=', REQUIRE_AUTH?'ON':'OFF',
-    '| REQUIRE_LP_PROGRAM=', REQUIRE_PROG?'ON':'OFF');
+    '| REQUIRE_LP_PROGRAM(soft)=', REQUIRE_PROG?'ON':'OFF');
   await subscribe();
 })();
