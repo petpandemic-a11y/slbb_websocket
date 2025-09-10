@@ -36,7 +36,53 @@ const DEFAULT_PROGRAMS = [
     .map(s => s.trim())
     .filter(Boolean)
 );
-const PROGRAM_KEYS = [...new Set(DEFAULT_PROGRAMS)].map(s => new PublicKey(s));
+const PROGRAM_KEYS = buildProgramKeys([...new Set(DEFAULT_PROGRAMS)]);
+// --- Robust base58 validation for program addresses ---
+function isValidBase58PublicKey(str){
+  try{
+    const pk = new PublicKey(str);
+    // If it constructed, it's valid 32-byte key.
+    return !!pk;
+  }catch(e){
+    return false;
+  }
+}
+function buildProgramKeys(list){
+  const keys = [];
+  for (const s of list){
+    const trimmed = (s || "").trim();
+    if (!trimmed) continue;
+    if (!/^[1-9A-HJ-NP-Za-km-z]+$/.test(trimmed)){
+      log(`[CONFIG] Skipping invalid (non-base58 chars): ${JSON.stringify(trimmed)}`);
+      continue;
+    }
+    if (!isValidBase58PublicKey(trimmed)){
+      log(`[CONFIG] Skipping invalid public key length: ${JSON.stringify(trimmed)}`);
+      continue;
+    }
+    try{
+      keys.push(new PublicKey(trimmed));
+    }catch(e){
+      log(`[CONFIG] Skipping invalid key (${trimmed}):`, e.message);
+    }
+  }
+  // dedupe by base58
+  const uniq = [];
+  const seen = new Set();
+  for (const k of keys){
+    const b58 = k.toBase58();
+    if (!seen.has(b58)){ uniq.push(k); seen.add(b58); }
+  }
+  if (uniq.length === 0){
+    log("[CONFIG] WARNING: No valid program addresses left. Using minimal Raydium set.");
+    const fallback = ["CAMMCzo5YL8w4VFF8KVHRk22GGUsp5VTaW7girrKgIrw","RVKd61ztZW9GUwhQYvDTKHzYS4sV6sKRQ39SL7jdpT2","675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"];
+    for (const s of fallback){
+      uniq.push(new PublicKey(s));
+    }
+  }
+  return uniq;
+}
+
 
 // Known constants
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
